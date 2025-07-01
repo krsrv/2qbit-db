@@ -69,7 +69,7 @@ def fit_parameters_least_squares(func, x_data, y_data, initial_guess, bounds=Non
     
     return result.x, rmse, result
 
-def fit_parameters_curve_fit(func, x_data, y_data, initial_guess, bounds=None):
+def fit_parameters_curve_fit(func, x_data, y_data, initial_guess, bounds=None, y_err=None):
     """
     Fit parameters using scipy.optimize.curve_fit
     
@@ -85,9 +85,9 @@ def fit_parameters_curve_fit(func, x_data, y_data, initial_guess, bounds=None):
         if bounds is not None:
             lb = [b[0] for b in bounds]
             ub = [b[1] for b in bounds]
-            popt, pcov = curve_fit(func, x_data, y_data, p0=initial_guess, bounds=(lb, ub))
+            popt, pcov = curve_fit(func, x_data, y_data, p0=initial_guess, bounds=(lb, ub), sigma=y_err)
         else:
-            popt, pcov = curve_fit(func, x_data, y_data, p0=initial_guess)
+            popt, pcov = curve_fit(func, x_data, y_data, p0=initial_guess, sigma=y_err)
         
         # Calculate RMSE
         predictions = func(x_data, *popt)

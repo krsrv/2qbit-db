@@ -174,7 +174,8 @@ def find_best_fit(
     y: np.ndarray, 
     device_characteristics: DeviceCharacteristics, 
     initial_guess: np.ndarray,
-    opt: Literal["global", "minimize", "curve", "least_squares"] = "global"
+    opt: Literal["global", "minimize", "curve", "least_squares"] = "global",
+    y_err: np.ndarray | None = None
     ):
     """Find the best fit for the given function type.
 
@@ -188,6 +189,7 @@ def find_best_fit(
         optimization method. The length of the array should match the number of tuples
         in the `device_characteristics` dictionary.
     opt: Underlying optimization method to use.
+    y_err: weight parameters (std devs) to be use for fitting functions in `curve_fit`
     """
     optimizable_func = OptimizableFunction(func_type, device_characteristics)
     bounds = device_characteristics.get_bounds_on_unknown_params();
@@ -210,7 +212,8 @@ def find_best_fit(
                 optimizable_func, 
                 x, y,
                 initial_guess,
-                bounds=bounds
+                bounds=bounds,
+                y_err=y_err
             )
         case "least_squares":
             optim_params, objective_value, result = fit_parameters_least_squares(
