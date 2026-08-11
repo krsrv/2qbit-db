@@ -88,14 +88,19 @@ LOWER_BOUNDS = np.array([-np.pi, -np.pi, -np.pi, 0.0, 0.0, 0.0, 0.0])
 UPPER_BOUNDS = np.array([np.pi, np.pi, np.pi, 1.0, 1.0, 1.0, 1.0])
 
 
-def residuals(x: np.ndarray, n: np.ndarray, data: np.ndarray) -> np.ndarray:
+def residuals(
+    x: np.ndarray, n: np.ndarray, data: np.ndarray, weighted: bool = True
+) -> np.ndarray:
     """
     data: shape (4, len(n)) with rows ordered as `STATES`.
     """
     eta, eps, kap, d1, d2, r1, r2 = x
     diffs = []
     model = get_fidelities(n, eta, eps, kap, d1, d2, r1, r2)
-    diffs = model.real - data
+    sigma = np.ones_like(data)
+    if weighted:
+        sigma = np.real(np.sqrt(model * (1 - model) / (n[None, :] + 1e-5)) + 1e-5)
+    diffs = (model.real - data) / sigma
     # equally weighted: every (state, n) residual counts once
     return diffs.reshape(-1)
 
@@ -146,4 +151,5 @@ def fit_joint(
     params = dict(zip(PARAM_NAMES, best_result.x))
     params["cost"] = best_result.cost
     params["rmse"] = float(np.sqrt(2 * best_result.cost / best_result.fun.size))
+    params["result"] = best_result
     return params
