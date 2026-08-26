@@ -115,8 +115,10 @@ def main():
                 row.update(canonicalize_signs(fit_params))
                 row.update({f"true_{name}": v for name, v in true_row.items()})
                 rows.append(row)
-                prev_fit_params = fit_params
-                print(f"Finished repetitions={repetitions}, shots={shots}.")
+                prev_fit_params = fit_params  # Warm-chaining solutions
+                print(
+                    f"Finished repetitions={repetitions}, shots={shots}, count={count}."
+                )
             # checkpoint after each (repetitions, shots) block
             write_rows(rows, path=args.output)
     return write_rows(rows, path=args.output)

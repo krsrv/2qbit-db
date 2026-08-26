@@ -141,6 +141,7 @@ def fit_joint(
     idx = 0
     curr_data = data.copy()
     curr_n = n.copy()
+    k = 1
     while True:
         if x0 is not None:
             x0_trial = np.asarray(x0, dtype=float) + np.concatenate(
@@ -162,14 +163,17 @@ def fit_joint(
             best_result = result
         if idx > n_restarts and best_result.cost < 1.2 * cost_scale:
             break
-        elif idx > 2 * n_restarts:
-            drop_idx = rng.integers(0, n.shape[0], 2)
+        elif idx > (2**k) * n_restarts:
+            drop_idx = rng.integers(0, n.shape[0], k)
             curr_n = np.delete(n, drop_idx)
             curr_data = np.delete(data, drop_idx, axis=1)
+        if idx >= (2 ** (k + 1)) * n_restarts:
+            k += 1
         idx += 1
-        print(
-            f"Running iter {idx}. Current cost scale: {best_result.cost/cost_scale:4e} * {cost_scale}"
-        )
+        if idx % 10 == 0:
+            print(
+                f"Running iter {idx}. Current cost scale: {best_result.cost/cost_scale:4e} * {cost_scale}"
+            )
 
     params = dict(zip(PARAM_NAMES, best_result.x))
     params["cost"] = best_result.cost
