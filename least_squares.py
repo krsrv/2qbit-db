@@ -89,7 +89,7 @@ UPPER_BOUNDS = np.array([np.pi, np.pi, np.pi, 1.0, 1.0, 1.0, 1.0])
 
 
 def residuals(
-    x: np.ndarray, n: np.ndarray, data: np.ndarray, weighted: bool = True
+    x: np.ndarray, n: np.ndarray, data: np.ndarray, shots: int, weighted: bool = True
 ) -> np.ndarray:
     """
     data: shape (4, len(n)) with rows ordered as `STATES`.
@@ -99,17 +99,18 @@ def residuals(
     model = get_fidelities(n, eta, eps, kap, d1, d2, r1, r2)
     sigma = np.ones_like(data)
     if weighted:
-        sigma = np.real(np.sqrt(model * (1 - model) / (n[None, :] + 1e-5)) + 1e-5)
+        # Check whether sigma is less than some threshold value.
+        sigma = np.real(np.sqrt(model * (1 - model) / (shots + 1e-5))) + 1e-5
     diffs = (model.real - data) / sigma
     # equally weighted: every (state, n) residual counts once
     return diffs.reshape(-1)
 
 
-def _run_least_squares(x0: np.ndarray, n: np.ndarray, data: np.ndarray):
+def _run_least_squares(x0: np.ndarray, n: np.ndarray, data: np.ndarray, shots: int):
     return least_squares(
         residuals,
         x0,
-        args=(n, data),
+        args=(n, data, shots),
         bounds=(LOWER_BOUNDS, UPPER_BOUNDS),
         xtol=1e-14,
         ftol=1e-14,
@@ -120,8 +121,9 @@ def _run_least_squares(x0: np.ndarray, n: np.ndarray, data: np.ndarray):
 def fit_joint(
     n: np.ndarray,
     data: np.ndarray,
+    shots: int,
     n_restarts: int = 40,
-    seed: int = 0,
+    rng: np.random.Generator = None,
     x0: np.ndarray | None = None,
 ) -> dict[str, float]:
     """Simultaneous, equally-weighted least-squares fit of all four fidelity curves.
@@ -132,21 +134,42 @@ def fit_joint(
     - x0 given: a single warm-started local refinement from that point. Use this
       to deterministically "seed" the fits.
     """
-    if x0 is not None:
-        best_result = _run_least_squares(np.asarray(x0, dtype=float), n, data)
-    else:
-        rng = np.random.default_rng(seed)
-        best_result = None
-        for _ in range(n_restarts):
+    cost_scale = (np.prod(data.shape) - 7) / 2  # len(x0) = 7
+
+    rng = np.random.default_rng() if rng is None else rng
+    best_result = None
+    idx = 0
+    curr_data = data.copy()
+    curr_n = n.copy()
+    while True:
+        if x0 is not None:
+            x0_trial = np.asarray(x0, dtype=float) + np.concatenate(
+                [
+                    rng.uniform(0, 0.01, size=3),
+                    rng.uniform(0, 0.001, size=4),
+                ]
+            )
+            x0_trial = np.clip(x0_trial, LOWER_BOUNDS, UPPER_BOUNDS)
+        else:
             x0_trial = np.concatenate(
                 [
                     rng.uniform(0, 0.02, size=3),
                     rng.uniform(0.97, 1.0, size=4),
                 ]
             )
-            result = _run_least_squares(x0_trial, n, data)
-            if best_result is None or result.cost < best_result.cost:
-                best_result = result
+        result = _run_least_squares(x0_trial, curr_n, curr_data, shots)
+        if best_result is None or result.cost < best_result.cost:
+            best_result = result
+        if idx > n_restarts and best_result.cost < 1.2 * cost_scale:
+            break
+        elif idx > 2 * n_restarts:
+            drop_idx = rng.integers(0, n.shape[0], 2)
+            curr_n = np.delete(n, drop_idx)
+            curr_data = np.delete(data, drop_idx, axis=1)
+        idx += 1
+        print(
+            f"Running iter {idx}. Current cost scale: {best_result.cost/cost_scale:4e} * {cost_scale}"
+        )
 
     params = dict(zip(PARAM_NAMES, best_result.x))
     params["cost"] = best_result.cost

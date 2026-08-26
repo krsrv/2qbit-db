@@ -15,31 +15,23 @@ Exports:
     `PHASE_NAMES`: list of phase parameter names, used to group parameters by type.
 """
 
+import argparse
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from least_squares import PARAM_NAMES, get_fidelities, fit_joint
+from least_squares import PARAM_NAMES, fit_joint, get_fidelities
 
 HERE = Path(__file__).resolve().parent
 OUTPUT_CSV = HERE / "output" / "error_bars_weighted.csv"
 
 
-def get_fit_data(data_gen_fn, fit_fn):
-    """
-    data_gen_fn: callable fn that produces a (k, n) noisy dataset corresponding to n datapoints
-      for k states in each call, with the same underlying noiseless data
-    fit_fn: callable fn that takes in data_gen_fn and n and returns a list of params
-    """
-    data = data_gen_fn()
-    fit_params = fit_fn(data)
-    return fit_params
-
-
-def construct_noisy_data(data, sigma=None):
+def construct_noisy_data(data, sigma=None, rng=None):
+    if rng is None:
+        rng = np.random.default_rng()
     # Additive white noise, one draw per (state, n) entry
-    noise = np.random.normal(0, sigma, np.shape(data))
+    noise = rng.normal(0, sigma, np.shape(data))
     noisy_data = data + noise
     return noisy_data
 
@@ -57,7 +49,7 @@ def canonicalize_signs(params):
     return dict(params)
 
 
-def write_rows(rows, path=OUTPUT_CSV):
+def write_rows(rows: list, path: Path):
     """Dump the accumulated fit records to `path` as a tidy CSV, one row per fit."""
     df = pd.DataFrame(rows)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -66,38 +58,68 @@ def write_rows(rows, path=OUTPUT_CSV):
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Generate error bars for fitted parameters and save to CSV."
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path(HERE / "output" / "error_bars.csv"),
+        help="Output file path (default: ./output/error_bars.csv)",
+    )
+    args = parser.parse_args()
+
     true_params = (
         0.4 * np.pi / 180,
         np.pi / 180,
         0.2 * np.pi / 180,
-        0.999,
-        0.999,
-        0.999,
-        0.999,
+        0.9998,
+        0.997,
+        0.998,
+        0.9996,
     )
     # store truth on the same branch as the fits. Otherwise, there can be a "synthetic"
     # bias in the fits.
     true_row = canonicalize_signs(dict(zip(PARAM_NAMES, true_params)))
     rows = []
-    for repetitions in range(10, 50, 5):
-        n_range = np.arange(repetitions)
-        true_data = get_fidelities(n_range, *true_params).real
-        for shots in range(1000, 11000, 1000):
-            sigma = np.sqrt(true_data * (1 - true_data) / shots)
-            data_gen_fn = lambda data=true_data, sigma=sigma: construct_noisy_data(
-                data, sigma
-            )
-            fit_fn = lambda data, n=n_range: fit_joint(n, data, n_restarts=5)
-            for count in range(20):
-                fit_params = get_fit_data(data_gen_fn, fit_fn)
+
+    seed = 1
+    rng = np.random.default_rng(seed=seed)
+    max_reps = 50
+    n_range = np.arange(max_reps)
+    shot_range = range(1000, 11000, 1000)
+    true_data = get_fidelities(n_range, *true_params).real
+
+    # Run sampling such that a noisy sample is created for 1,...,max_reps for a given number of
+    # shots and prefixes are used for each repetition run.
+    for shots in shot_range:
+        sigma = np.sqrt(true_data * (1 - true_data) / shots)
+        for count in range(20):
+            noisy_data_max_rep = construct_noisy_data(true_data, sigma, rng=rng)
+            prev_fit_params = None
+            for repetitions in range(10, max_reps, 5):
+                data = noisy_data_max_rep[:, :repetitions]
+                fit_params = fit_joint(
+                    np.arange(repetitions),
+                    data,
+                    shots,
+                    n_restarts=10,
+                    rng=rng,
+                    x0=(
+                        prev_fit_params["result"].x
+                        if prev_fit_params is not None
+                        else None
+                    ),
+                )
                 row = {"repetitions": repetitions, "shots": shots, "count": count}
                 row.update(canonicalize_signs(fit_params))
                 row.update({f"true_{name}": v for name, v in true_row.items()})
                 rows.append(row)
+                prev_fit_params = fit_params
+                print(f"Finished repetitions={repetitions}, shots={shots}.")
             # checkpoint after each (repetitions, shots) block
-            write_rows(rows)
-            print(f"Finished repetitions={repetitions}, shots={shots}.")
-    return write_rows(rows)
+            write_rows(rows, path=args.output)
+    return write_rows(rows, path=args.output)
 
 
 if __name__ == "__main__":

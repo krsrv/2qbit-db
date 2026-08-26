@@ -2,10 +2,10 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-
-from least_squares import PARAM_NAMES, get_fidelities, fit_joint
 import scipy
 from matplotlib import pyplot as plt
+
+from least_squares import fit_joint, get_fidelities
 
 HERE = Path(__file__).resolve().parent
 OUTPUT_CSV = HERE / "output" / "error_bars.csv"

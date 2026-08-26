@@ -19,6 +19,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+
 from least_squares import fit_joint, get_fidelities
 
 HERE = Path(__file__).resolve().parent
