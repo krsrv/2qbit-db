@@ -77,7 +77,7 @@ def get_fidelities(n, eta, eps, kap, d1, d2, r1, r2) -> np.ndarray:
     n may be a scalar or an array."""
     modes = mode_values(eta, eps, kap, d1, d2, r1, r2)
     powers = modes ** np.asarray(n)[..., None]
-    return (powers @ COEFF_MATRIX.T / 16).T
+    return powers @ COEFF_MATRIX.T / 16
 
 
 # ---------------------------------------------------------------------------

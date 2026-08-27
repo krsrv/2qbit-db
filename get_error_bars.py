@@ -30,9 +30,11 @@ OUTPUT_CSV = HERE / "output" / "error_bars_weighted.csv"
 def construct_noisy_data(data, sigma=None, rng=None):
     if rng is None:
         rng = np.random.default_rng()
-    # Additive white noise, one draw per (state, n) entry
-    noise = rng.normal(0, sigma, np.shape(data))
-    noisy_data = data + noise
+    # Additive correlated noise, one draw per (state, n) entry
+    noisy_data = np.stack(
+        [rng.multivariate_normal(data[i], sigma[i]) for i in range(sigma.shape[0])],
+        axis=0,
+    )
     return noisy_data
 
 
@@ -93,12 +95,26 @@ def main():
     # Run sampling such that a noisy sample is created for 1,...,max_reps for a given number of
     # shots and prefixes are used for each repetition run.
     for shots in shot_range:
-        sigma = np.sqrt(true_data * (1 - true_data) / shots)
+        # Generate covariance matrix:
+        # C_ij = sum_ij delta_ij p(AX=e_i) - p(AX=e_i) . p(AX=e_j)
+        # Where A is the confusion matrix, X is the true matrix. Note that
+        # even when A is Identity, the output vector will have correlated
+        # distance.
+        sigma = (
+            np.stack(
+                [
+                    np.diag(true_data[i]) - np.outer(true_data[i], true_data[i])
+                    for i in range(max_reps)
+                ],
+                axis=0,
+            )
+            / shots**2
+        )
         for count in range(20):
             noisy_data_max_rep = construct_noisy_data(true_data, sigma, rng=rng)
             prev_fit_params = None
             for repetitions in range(10, max_reps, 5):
-                data = noisy_data_max_rep[:, :repetitions]
+                data = noisy_data_max_rep[:repetitions]
                 fit_params = fit_joint(
                     np.arange(repetitions),
                     data,
@@ -115,7 +131,7 @@ def main():
                 row.update(canonicalize_signs(fit_params))
                 row.update({f"true_{name}": v for name, v in true_row.items()})
                 rows.append(row)
-                prev_fit_params = fit_params  # Warm-chaining solutions
+                # prev_fit_params = fit_params  # Warm-chaining solutions
                 print(
                     f"Finished repetitions={repetitions}, shots={shots}, count={count}."
                 )
