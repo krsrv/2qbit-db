@@ -1,17 +1,18 @@
+import argparse
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from matplotlib.colors import LogNorm, SymLogNorm
+from matplotlib.colors import LogNorm
 
 from get_error_bars import PHASE_NAMES
 from least_squares import PARAM_NAMES
 
 HERE = Path(__file__).resolve().parent
 INPUT_CSV = HERE / "output" / "error_bars.csv"
-STD_PDF = HERE / "output" / "error_bars_std_heatmaps_weighted.pdf"
-BIAS_PDF = HERE / "output" / "error_bars_bias_heatmaps_weighted.pdf"
+STD_PDF = HERE / "output" / "error_bars_std_heatmaps.pdf"
+BIAS_PDF = HERE / "output" / "error_bars_bias_heatmaps.pdf"
 
 DECAY_NAMES = [name for name in PARAM_NAMES if name not in PHASE_NAMES]
 # The phases and the decay coefficients carry different units and magnitudes, so each
@@ -145,11 +146,34 @@ def print_means(means, true_row, df):
 
 
 def main():
-    stds, means, biases, true_row, df = load_grids()
+    parser = argparse.ArgumentParser(
+        description="Plot std dev and bias heatmaps of fitted parameters from an error bar CSV."
+    )
+    parser.add_argument(
+        "--input",
+        type=Path,
+        default=INPUT_CSV,
+        help="Input CSV of fit results (default: ./output/error_bars.csv)",
+    )
+    parser.add_argument(
+        "--std-output",
+        type=Path,
+        default=STD_PDF,
+        help="Std dev heatmap path (default: ./output/error_bars_std_heatmaps.pdf)",
+    )
+    parser.add_argument(
+        "--bias-output",
+        type=Path,
+        default=BIAS_PDF,
+        help="Bias heatmap path (default: ./output/error_bars_bias_heatmaps.pdf)",
+    )
+    args = parser.parse_args()
+
+    stds, means, biases, true_row, df = load_grids(args.input)
     print_means(means, true_row, df)
-    plot_std_heatmaps(means, stds)
-    plot_bias_heatmaps(biases)
-    print(f"\nWrote {STD_PDF}\nWrote {BIAS_PDF}")
+    plot_std_heatmaps(means, stds, path=args.std_output)
+    plot_bias_heatmaps(biases, path=args.bias_output)
+    print(f"\nWrote {args.std_output}\nWrote {args.bias_output}")
     plt.show()
 
 
