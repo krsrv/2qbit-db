@@ -101,15 +101,9 @@ def main():
         # even when A is Identity, the output vector will have correlated
         # distance.
         sigma = (
-            np.stack(
-                [
-                    np.diag(true_data[i]) - np.outer(true_data[i], true_data[i])
-                    for i in range(max_reps)
-                ],
-                axis=0,
-            )
-            / shots**2
-        )
+            true_data[:, :, None] * np.eye(4)
+            - true_data[:, :, None] * true_data[:, None, :]
+        ) / shots
         for count in range(20):
             noisy_data_max_rep = construct_noisy_data(true_data, sigma, rng=rng)
             prev_fit_params = None
@@ -131,7 +125,7 @@ def main():
                 row.update(canonicalize_signs(fit_params))
                 row.update({f"true_{name}": v for name, v in true_row.items()})
                 rows.append(row)
-                # prev_fit_params = fit_params  # Warm-chaining solutions
+                prev_fit_params = fit_params  # Warm-chaining solutions
                 print(
                     f"Finished repetitions={repetitions}, shots={shots}, count={count}."
                 )

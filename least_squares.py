@@ -81,37 +81,63 @@ def get_fidelities(n, eta, eps, kap, d1, d2, r1, r2) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Simultaneous, equally-weighted least-squares fit
+# Simultaneous, inverse-covariance-weighted least-squares fit
 # ---------------------------------------------------------------------------
 
 LOWER_BOUNDS = np.array([-np.pi, -np.pi, -np.pi, 0.0, 0.0, 0.0, 0.0])
 UPPER_BOUNDS = np.array([np.pi, np.pi, np.pi, 1.0, 1.0, 1.0, 1.0])
 
 
-def residuals(
-    x: np.ndarray, n: np.ndarray, data: np.ndarray, shots: int, weighted: bool = True
-) -> np.ndarray:
+# Scale of each parameter's natural variation, used as `x_scale` so the trust region
+# treats a 1e-2 rad phase step and a 1e-3 decay step as comparably sized.
+X_SCALE = np.array([1e-2, 1e-2, 1e-2, 1e-3, 1e-3, 1e-3, 1e-3])
+
+
+def make_whitener(data: np.ndarray, shots: int) -> np.ndarray:
+    """Per-step whitening matrices W[i] = L[i]^-1, where cov[i] = L[i] L[i].T.
+
+    `data` is (len(n), 4): each row is one multinomial estimate of the four outcome
+    probabilities from `shots` shots, so cov[i] = (diag(p) - p p.T) / shots, which
+    has rank 3, instead of full rank. Since the 4th element is statistically redundant,
+    we drop the last outcome and whiten the leading 3x3 block, which is positive definite
+    whenever the dropped outcome has nonzero probability.
+    Alternatives would be to use Moore-Penrose inverse.
+
+    The weights are calculated once for each data.
     """
-    data: shape (4, len(n)) with rows ordered as `STATES`.
+    p = np.clip(data, 1e-6, None)
+    p = p / p.sum(axis=1, keepdims=True)
+    q = p[:, :3]  # 3 degrees of freedom per row
+    cov = (q[:, :, None] * np.eye(3) - q[:, :, None] * q[:, None, :]) / shots
+    return np.linalg.inv(np.linalg.cholesky(cov + 1e-12 * np.eye(3)))
+
+
+def residuals(
+    x: np.ndarray, n: np.ndarray, data: np.ndarray, whitener: np.ndarray | None = None
+) -> np.ndarray:
+    """Residual vector for `least_squares`.
+
+    data: shape (len(n), 4) with columns ordered as `STATES`.
+    whitener: inverse of Cholesky decomposed lower triangular matrix. Used as a
+        whitening transformation for the data.
     """
     eta, eps, kap, d1, d2, r1, r2 = x
-    diffs = []
-    model = get_fidelities(n, eta, eps, kap, d1, d2, r1, r2)
-    sigma = np.ones_like(data)
-    if weighted:
-        # Check whether sigma is less than some threshold value.
-        sigma = np.real(np.sqrt(model * (1 - model) / (shots + 1e-5))) + 1e-5
-    diffs = (model.real - data) / sigma
-    # equally weighted: every (state, n) residual counts once
-    return diffs.reshape(-1)
+    model_data = get_fidelities(n, eta, eps, kap, d1, d2, r1, r2).real
+    diffs = model_data - data
+    if whitener is None:
+        return diffs.reshape(-1)
+    return (whitener @ diffs[:, :3, None]).reshape(-1)
 
 
-def _run_least_squares(x0: np.ndarray, n: np.ndarray, data: np.ndarray, shots: int):
+def _run_least_squares(
+    x0: np.ndarray, n: np.ndarray, data: np.ndarray, whitener: np.ndarray
+):
     return least_squares(
         residuals,
         x0,
-        args=(n, data, shots),
+        args=(n, data, whitener),
         bounds=(LOWER_BOUNDS, UPPER_BOUNDS),
+        # x_scale=X_SCALE,
         xtol=1e-14,
         ftol=1e-14,
         gtol=1e-14,
@@ -126,7 +152,7 @@ def fit_joint(
     rng: np.random.Generator = None,
     x0: np.ndarray | None = None,
 ) -> dict[str, float]:
-    """Simultaneous, equally-weighted least-squares fit of all four fidelity curves.
+    """Simultaneous, inverse-covariance-weighted least-squares fit of all four curves.
 
     Two modes:
     - x0 is None: global search via random multi-start (n_restarts draws), keeping
@@ -134,13 +160,17 @@ def fit_joint(
     - x0 given: a single warm-started local refinement from that point. Use this
       to deterministically "seed" the fits.
     """
-    cost_scale = (np.prod(data.shape) - 7) / 2  # len(x0) = 7
+    cost_scale = (np.prod(data[:, :-1].shape) - 7) / 2  # len(x0) = 7
 
     rng = np.random.default_rng() if rng is None else rng
     best_result = None
     idx = 0
     curr_data = data.copy()
     curr_n = n.copy()
+    # Build whitening transformation once here, and reuse for each restart.
+    # Rebuilt when `curr_data` changes below.
+    orig_whitener = make_whitener(curr_data, shots)
+    whitener = orig_whitener.copy()
     k = 1
     while True:
         if x0 is not None:
@@ -158,16 +188,17 @@ def fit_joint(
                     rng.uniform(0.97, 1.0, size=4),
                 ]
             )
-        result = _run_least_squares(x0_trial, curr_n, curr_data, shots)
+        result = _run_least_squares(x0_trial, curr_n, curr_data, whitener)
         if best_result is None or result.cost < best_result.cost:
             best_result = result
         if idx > n_restarts and best_result.cost < 1.2 * cost_scale:
             break
-        elif idx > (2**k) * n_restarts:
+        elif idx > (4**k) * n_restarts:
             drop_idx = rng.integers(0, n.shape[0], k)
             curr_n = np.delete(n, drop_idx)
-            curr_data = np.delete(data, drop_idx, axis=1)
-        if idx >= (2 ** (k + 1)) * n_restarts:
+            curr_data = np.delete(data, drop_idx, axis=0)
+            whitener = make_whitener(curr_data, shots)
+        if idx >= (4 ** (k + 1)) * n_restarts:
             k += 1
         idx += 1
         if idx % 10 == 0:
@@ -176,7 +207,9 @@ def fit_joint(
             )
 
     params = dict(zip(PARAM_NAMES, best_result.x))
-    params["cost"] = best_result.cost
+    params["true_cost"] = 0.5 * np.sum(
+        residuals(best_result.x, n, data, orig_whitener) ** 2
+    )
     params["rmse"] = float(np.sqrt(2 * best_result.cost / best_result.fun.size))
     params["result"] = best_result
     return params
