@@ -75,10 +75,14 @@ def main():
         0.4 * np.pi / 180,
         np.pi / 180,
         0.2 * np.pi / 180,
-        0.9998,
+        0.0001,
+        0.003,
+        0.002,
+        0.001,
+        0.991,
+        0.992,
         0.997,
-        0.998,
-        0.9996,
+        0.995,
     )
     # store truth on the same branch as the fits. Otherwise, there can be a "synthetic"
     # bias in the fits.

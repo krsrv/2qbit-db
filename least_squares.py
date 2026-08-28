@@ -22,7 +22,7 @@ HERE = Path(__file__).resolve().parent
 
 STATES = ["++", "+-", "-+", "--"]
 CSV_COLUMN_FOR_STATE = {"++": "pp", "+-": "pm", "-+": "mp", "--": "mm"}
-PARAM_NAMES = ["eta", "eps", "kap", "d1", "d2", "r1", "r2"]
+PARAM_NAMES = ["eta", "eps", "kap", "d1", "d2", "r1", "r2", "p1", "p2", "p3", "p4"]
 
 # Every fidelity is (1/16) * sum_k c_k * mode_k ** n over the same 13 modes; only the
 # coefficients c_k depend on the state. The modes are 6 conjugate pairs
@@ -72,20 +72,133 @@ def mode_values(eta, eps, kap, d1, d2, r1, r2) -> np.ndarray:
     return np.concatenate([pairs.reshape(-1), [1.0 + 0j]])
 
 
-def get_fidelities(n, eta, eps, kap, d1, d2, r1, r2) -> np.ndarray:
-    """All four fidelities at once, shape (4, len(n)) with rows ordered as `STATES`.
-    n may be a scalar or an array."""
-    modes = mode_values(eta, eps, kap, d1, d2, r1, r2)
-    powers = modes ** np.asarray(n)[..., None]
-    return powers @ COEFF_MATRIX.T / 16
+# ---------------------------------------------------------------------------
+# Vectorized Lindblad generator of one repetition
+# ---------------------------------------------------------------------------
+
+I2 = np.eye(2)
+SIGMA_Z = np.array([[1.0, 0.0], [0.0, -1.0]])
+H = 1 / np.sqrt(2) * np.array([[1.0, 1.0], [1.0, -1.0]])
+SIGMA_MINUS = np.array([[0.0, 1.0], [0.0, 0.0]])  # lowering operator
+
+IDEAL_MSMT_OPS = np.zeros((4, 4, 4))
+for i in range(4):
+    IDEAL_MSMT_OPS[i, i, i] = 1
+    IDEAL_MSMT_OPS[i] = np.kron(H, H) @ IDEAL_MSMT_OPS[i] @ np.kron(H, H)
+IDEAL_MSMT_OPS = IDEAL_MSMT_OPS.reshape(4, -1)
+
+
+def _on(m: np.ndarray, qubit: int) -> np.ndarray:
+    """Single-qubit operator `m` acting on `qubit` (0 = left factor) of the pair."""
+    return np.kron(m, I2) if qubit == 0 else np.kron(I2, m)
+
+
+def _hamiltonian_super(h: np.ndarray) -> np.ndarray:
+    """Superoperator of -i [h, .], using vec(A rho B) = kron(A, B.T)."""
+    eye = np.eye(4)
+    return -1j * (np.kron(h, eye) - np.kron(eye, h.T))
+
+
+def _dissipator_super(c: np.ndarray) -> np.ndarray:
+    """Superoperator of c rho c^dag - {c^dag c, rho} / 2, for jump operator `c`."""
+    eye = np.eye(4)
+    num = c.conj().T @ c  # c^dag c
+    return np.kron(c, c.conj()) - 0.5 * (np.kron(num, eye) + np.kron(eye, num.T))
+
+
+# The generator is *linear* in (eta, eps, kap, d1**2, d2**2, r1**2, r2**2): each Hamiltonian
+# term carries one phase parameter, and each jump operator is a fixed matrix scaled by
+# its rate, so its dissipator is quadratic in that rate. Build the seven 16x16 basis
+# superoperators once at import; construct_unit_operator is then a single (256, 7) @ (7,)
+# product rather than the ~20 np.kron calls it used to cost on every residual evaluation.
+_GENERATOR_BASIS = np.array(
+    [
+        _hamiltonian_super(np.kron(SIGMA_Z, SIGMA_Z)),  # eta
+        _hamiltonian_super(_on(SIGMA_Z, 0)),  # eps
+        _hamiltonian_super(_on(SIGMA_Z, 1)),  # kap
+        _dissipator_super(0.5 * _on(SIGMA_Z, 0)),  # scaled by d1
+        _dissipator_super(0.5 * _on(SIGMA_Z, 1)),  # scaled by d2
+        _dissipator_super(2.0 * _on(SIGMA_MINUS, 0)),  # scaled by r1
+        _dissipator_super(2.0 * _on(SIGMA_MINUS, 1)),  # scaled by r2
+    ],
+    dtype=complex,
+).reshape(7, -1)
+
+
+def construct_unit_operator(eta, eps, kap, d1, d2, r1, r2) -> np.ndarray:
+    """The (16, 16) Lindblad generator of one time step as a superoperator.
+
+    - vec(A rho B) = kron(A, B.T)
+    - d rho / dt = -i [H, rho] + sum_k (c_k rho c_k^dag - {c_k^dag c_k, rho} / 2)
+    - H = eta ZZ + eps ZI + kap IZ
+    - c_k = 1/2 d1 Z_1, 1/2 d2 Z_2, 2 r1 sigma^-_1, 2 r2 sigma^-_2
+    """
+    coefficients = np.array([eta, eps, kap, d1, d2, r1, r2], dtype=complex)
+    return (_GENERATOR_BASIS.T @ coefficients).reshape(16, 16)
+
+
+def construct_init_state(init1, init2):
+    confusion = np.outer([init1, 1 - init1], [init2, 1 - init2]).reshape(-1)
+    return confusion @ IDEAL_MSMT_OPS
+
+
+def construct_msmt_op(out1, out2):
+    a = np.array([[out1, 1 - out1], [1 - out1, out1]])
+    b = np.array([[out2, 1 - out2], [1 - out2, out2]])
+    confusion = (a[:, None, :, None] * b[None, :, None, :]).reshape(4, 4)  # kron(a, b)
+    return confusion @ IDEAL_MSMT_OPS
+
+
+def get_fidelities(
+    n, eta, eps, kap, d1, d2, r1, r2, init1, init2, out1, out2
+) -> np.ndarray:
+    """
+    All four fidelities at once, shape (len(n), 4) with columns ordered as `STATES`.
+    n may be a scalar or an array.
+
+    Args:
+        n: Integer or array of time steps.
+        eta, eps, kap: Phase parameters for (ZZ, ZI, IZ).
+        d1, d2: Dephasing rates (sigma_z/2).
+        r1, r2: Relaxation rates (2 sigma_-).
+        init1, init2: Flip probabilities in initial state prep for each qubit
+        out1, out2: POVM mixing rates for each qubit
+
+    Returns:
+        Array of shape (len(n), 4): fidelities for each computational basis state at each n.
+    """
+    if isinstance(n, (int, np.integer)):
+        n = np.arange(n)
+    n = np.asarray(n, dtype=float)
+
+    unit_op = construct_unit_operator(eta, eps, kap, d1, d2, r1, r2)
+    state = construct_init_state(init1, init2).astype(complex)
+    msmt_ops = construct_msmt_op(out1, out2)
+
+    # exp(G t) s0 = V diag(exp(w t)) V^-1 s0, so one eigendecomposition of the (16, 16)
+    # generator gives *every* time step: fold V^-1 s0 and msmt_ops @ V into a single
+    # (16, 4) weight matrix, and the whole trajectory is one (len(n), 16) @ (16, 4)
+    # product. This replaces a Python loop of len(n) expm_multiply calls (~3 orders of
+    # magnitude slower), which matters because `residuals` runs this on every function
+    # and finite-difference Jacobian evaluation of every least_squares restart.
+    #
+    # The generator is a Kronecker sum of single-qubit Lindbladians and stays
+    # diagonalizable across the whole parameter box (cond(V) <= 6 everywhere in
+    # LOWER_BOUNDS..UPPER_BOUNDS, including the degenerate corners), so this is exact
+    # to machine precision rather than an approximation.
+    eigenvalues, eigenvectors = np.linalg.eig(unit_op)
+    weights = (msmt_ops @ eigenvectors) * np.linalg.solve(eigenvectors, state)
+    return np.real(np.exp(np.multiply.outer(4 * n, eigenvalues)) @ weights.T)
 
 
 # ---------------------------------------------------------------------------
 # Simultaneous, inverse-covariance-weighted least-squares fit
 # ---------------------------------------------------------------------------
 
-LOWER_BOUNDS = np.array([-np.pi, -np.pi, -np.pi, 0.0, 0.0, 0.0, 0.0])
-UPPER_BOUNDS = np.array([np.pi, np.pi, np.pi, 1.0, 1.0, 1.0, 1.0])
+LOWER_BOUNDS = np.array(
+    [-np.pi, -np.pi, -np.pi, 0.0, 0.0, 0.0, 0.0, 0.99, 0.99, 0.99, 0.99]
+)
+UPPER_BOUNDS = np.array([np.pi, np.pi, np.pi, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
 
 
 # Scale of each parameter's natural variation, used as `x_scale` so the trust region
@@ -121,8 +234,7 @@ def residuals(
     whitener: inverse of Cholesky decomposed lower triangular matrix. Used as a
         whitening transformation for the data.
     """
-    eta, eps, kap, d1, d2, r1, r2 = x
-    model_data = get_fidelities(n, eta, eps, kap, d1, d2, r1, r2).real
+    model_data = get_fidelities(n, *x).real
     diffs = model_data - data
     if whitener is None:
         return diffs.reshape(-1)
@@ -160,7 +272,7 @@ def fit_joint(
     - x0 given: a single warm-started local refinement from that point. Use this
       to deterministically "seed" the fits.
     """
-    cost_scale = (np.prod(data[:, :-1].shape) - 7) / 2  # len(x0) = 7
+    cost_scale = (np.prod(data[:, :-1].shape) - len(PARAM_NAMES)) / 2  # len(x0) = 7
 
     rng = np.random.default_rng() if rng is None else rng
     best_result = None
@@ -178,14 +290,16 @@ def fit_joint(
                 [
                     rng.uniform(0, 0.01, size=3),
                     rng.uniform(0, 0.001, size=4),
+                    rng.uniform(0.0, 0.001, size=4),
                 ]
             )
             x0_trial = np.clip(x0_trial, LOWER_BOUNDS, UPPER_BOUNDS)
         else:
             x0_trial = np.concatenate(
                 [
-                    rng.uniform(0, 0.02, size=3),
-                    rng.uniform(0.97, 1.0, size=4),
+                    rng.uniform(0.0, 0.02, size=3),
+                    rng.uniform(0.0, 0.003, size=4),
+                    rng.uniform(0.99, 1.0, size=4),
                 ]
             )
         result = _run_least_squares(x0_trial, curr_n, curr_data, whitener)
