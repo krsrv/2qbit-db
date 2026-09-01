@@ -196,9 +196,13 @@ def get_fidelities(
 # ---------------------------------------------------------------------------
 
 LOWER_BOUNDS = np.array(
-    [-np.pi, -np.pi, -np.pi, 0.0, 0.0, 0.0, 0.0, 0.99, 0.99, 0.99, 0.99]
+    # n, eta, eps, kap, d1, d2, r1, r2, init1, init2, out1, out2
+    [-np.pi, -np.pi, -np.pi, 0.0, 0.0, 0.0, 0.0, 0.9, 0.9, 0.9, 0.9]
 )
-UPPER_BOUNDS = np.array([np.pi, np.pi, np.pi, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+UPPER_BOUNDS = np.array(
+    # n, eta, eps, kap, d1, d2, r1, r2, init1, init2, out1, out2
+    [np.pi, np.pi, np.pi, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+)
 
 
 # Scale of each parameter's natural variation, used as `x_scale` so the trust region
@@ -206,53 +210,60 @@ UPPER_BOUNDS = np.array([np.pi, np.pi, np.pi, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
 X_SCALE = np.array([1e-2, 1e-2, 1e-2, 1e-3, 1e-3, 1e-3, 1e-3])
 
 
-def make_whitener(data: np.ndarray, shots: int) -> np.ndarray:
-    """Per-step whitening matrices W[i] = L[i]^-1, where cov[i] = L[i] L[i].T.
-
-    `data` is (len(n), 4): each row is one multinomial estimate of the four outcome
-    probabilities from `shots` shots, so cov[i] = (diag(p) - p p.T) / shots, which
-    has rank 3, instead of full rank. Since the 4th element is statistically redundant,
-    we drop the last outcome and whiten the leading 3x3 block, which is positive definite
-    whenever the dropped outcome has nonzero probability.
-    Alternatives would be to use Moore-Penrose inverse.
-
-    The weights are calculated once for each data.
-    """
-    p = np.clip(data, 1e-6, None)
-    p = p / p.sum(axis=1, keepdims=True)
-    q = p[:, :3]  # 3 degrees of freedom per row
-    cov = (q[:, :, None] * np.eye(3) - q[:, :, None] * q[:, None, :]) / shots
-    return np.linalg.inv(np.linalg.cholesky(cov + 1e-12 * np.eye(3)))
+# Probabilities below this are treated as this value when they set the weights, so a
+# model prediction that runs to zero cannot produce an infinite weight.
+MIN_WEIGHT_PROB = 1e-12
 
 
 def residuals(
-    x: np.ndarray, n: np.ndarray, data: np.ndarray, whitener: np.ndarray | None = None
+    x: np.ndarray,
+    n: np.ndarray,
+    data: np.ndarray,
+    shots: int,
+    weight_probs: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Residual vector for `least_squares`.
+    """Whitened residual vector for `least_squares`.
+
+    Each row of `data` is one estimate of the four outcome probabilities from `shots`
+    shots, so its covariance is cov = (diag(p) - p p.T) / shots, which has rank 3 rather
+    than 4. Inverse of the 3x3 block gives cov^-1 = shots * (diag(1/q) + 1 1.T / q4)
+    with q4 = 1 - sum(q) the dropped outcome. Since the four residuals sum to zero,
+    the quadratic form r.T cov^-1 r becomes shots * sum_i r_i^2 / p_i over all four
+    outcomes. So the whitened residual is just sqrt(shots) * r / sqrt(p).
+
+    The vector has 4 entries per time step but still only 3 independent
+    ones, so the degrees of freedom are 3 * len(n) - len(PARAM_NAMES).
 
     data: shape (len(n), 4) with columns ordered as `STATES`.
-    whitener: inverse of Cholesky decomposed lower triangular matrix. Used as a
-        whitening transformation for the data.
+    shots: shots per time step, setting the scale of the covariance.
+    weight_probs: probabilities defining the covariance, shape (len(n), 4). None means
+        "use the model prediction at `x`", so the weights track the current estimate.
+        Pass an array to hold them fixed, as the iterated GLS passes in `fit_joint` do.
     """
     model_data = get_fidelities(n, *x).real
+    probs = model_data if weight_probs is None else weight_probs
     diffs = model_data - data
-    if whitener is None:
-        return diffs.reshape(-1)
-    return (whitener @ diffs[:, :3, None]).reshape(-1)
+    return (
+        np.sqrt(shots) * diffs / np.sqrt(np.clip(probs, MIN_WEIGHT_PROB, None))
+    ).reshape(-1)
 
 
 def _run_least_squares(
-    x0: np.ndarray, n: np.ndarray, data: np.ndarray, whitener: np.ndarray
+    x0: np.ndarray,
+    n: np.ndarray,
+    data: np.ndarray,
+    shots: int,
+    weight_probs: np.ndarray | None = None,
 ):
     return least_squares(
         residuals,
         x0,
-        args=(n, data, whitener),
+        args=(n, data, shots, weight_probs),
         bounds=(LOWER_BOUNDS, UPPER_BOUNDS),
         # x_scale=X_SCALE,
-        xtol=1e-14,
-        ftol=1e-14,
-        gtol=1e-14,
+        xtol=1e-8,
+        ftol=1e-8,
+        gtol=1e-8,
     )
 
 
@@ -263,14 +274,23 @@ def fit_joint(
     n_restarts: int = 40,
     rng: np.random.Generator = None,
     x0: np.ndarray | None = None,
+    n_gls_passes: int = 2,
+    gls_tol: float = 1e-9,
 ) -> dict[str, float]:
     """Simultaneous, inverse-covariance-weighted least-squares fit of all four curves.
 
-    Two modes:
-    - x0 is None: global search via random multi-start (n_restarts draws), keeping
-      the lowest-cost result. Use this for an unbiased fit.
-    - x0 given: a single warm-started local refinement from that point. Use this
-      to deterministically "seed" the fits.
+    Iterated GLS:
+    - 1st pass: Uses noisy estimates of the covariance. The resulting optimization
+     adds a term  whose expectation is -tr(Sigma^-1 dSigma/dx) / 2, which has a
+     O(1/shots) bias which does not decrease with number of time steps.
+    - 2nd pass: Freeze the covariance weights and rerun GLS. This step removes the
+    bias -tr(Sigma^-1 dSigma/dx) / 2.
+
+    Args:
+    - x0 : if None, search via random multi-start (n_restarts draws). If not None
+        search via perturbations around x0.
+    - n_gls_passes: maximum reweighting passes after the noisy search. 0 disables it.
+    - gls_tol: stop reweighting once no parameter moves by more than this.
     """
     cost_scale = (np.prod(data[:, :-1].shape) - len(PARAM_NAMES)) / 2  # len(x0) = 7
 
@@ -279,10 +299,9 @@ def fit_joint(
     idx = 0
     curr_data = data.copy()
     curr_n = n.copy()
-    # Build whitening transformation once here, and reuse for each restart.
-    # Rebuilt when `curr_data` changes below.
-    orig_whitener = make_whitener(curr_data, shots)
-    whitener = orig_whitener.copy()
+    num_data = n.shape[0]
+    # Track which rows produced `best_result`, since deletions below can change them.
+    best_n, best_data = curr_n, curr_data
     k = 1
     while True:
         if x0 is not None:
@@ -302,16 +321,17 @@ def fit_joint(
                     rng.uniform(0.99, 1.0, size=4),
                 ]
             )
-        result = _run_least_squares(x0_trial, curr_n, curr_data, whitener)
+        result = _run_least_squares(x0_trial, curr_n, curr_data, shots)
         if best_result is None or result.cost < best_result.cost:
             best_result = result
+            best_n, best_data = curr_n, curr_data
         if idx > n_restarts and best_result.cost < 1.2 * cost_scale:
             break
         elif idx > (4**k) * n_restarts:
             drop_idx = rng.integers(0, n.shape[0], k)
             curr_n = np.delete(n, drop_idx)
             curr_data = np.delete(data, drop_idx, axis=0)
-            whitener = make_whitener(curr_data, shots)
+            weight_probs = np.clip(curr_data, 1e-6, None)
         if idx >= (4 ** (k + 1)) * n_restarts:
             k += 1
         idx += 1
@@ -319,11 +339,27 @@ def fit_joint(
             print(
                 f"Running iter {idx}. Current cost scale: {best_result.cost/cost_scale:4e} * {cost_scale}"
             )
+        if k / num_data > 0.1:
+            break
+
+    # Iterated GLS refinement on the rows the search actually converged on.
+    # Costs are not comparable across passes -- each uses different weights -- so every pass is
+    # accepted rather than being kept only when it lowers the cost.
+    weight_probs = get_fidelities(best_n, *best_result.x).real
+    for _ in range(n_gls_passes):
+        refined = _run_least_squares(
+            best_result.x, best_n, best_data, shots, weight_probs
+        )
+        shift = np.max(np.abs(refined.x - best_result.x))
+        best_result = refined
+        if shift < gls_tol:
+            break
 
     params = dict(zip(PARAM_NAMES, best_result.x))
-    params["true_cost"] = 0.5 * np.sum(
-        residuals(best_result.x, n, data, orig_whitener) ** 2
-    )
-    params["rmse"] = float(np.sqrt(2 * best_result.cost / best_result.fun.size))
+    params["true_cost"] = 0.5 * np.sum(residuals(best_result.x, n, data, shots) ** 2)
+    # The residual vector carries 4 entries per time step but only 3 independent ones,
+    # so divide by the degrees of freedom rather than by `best_result.fun.size`.
+    dof = 3 * len(n) - len(PARAM_NAMES)
+    params["rmse"] = float(np.sqrt(2 * params["true_cost"] / dof))
     params["result"] = best_result
     return params
