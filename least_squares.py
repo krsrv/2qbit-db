@@ -186,11 +186,11 @@ def get_fidelities(
 # ---------------------------------------------------------------------------
 
 LOWER_BOUNDS = np.array(
-    # n, eta, eps, kap, d1, d2, r1, r2, init1, init2, out1, out2
+    # eta, eps, kap, d1, d2, r1, r2, init1, init2, out1, out2
     [-np.pi, -np.pi, -np.pi, -0.1, -0.1, -0.1, -0.1, 0.0, 0.0, 0.0, 0.0]
 )
 UPPER_BOUNDS = np.array(
-    # n, eta, eps, kap, d1, d2, r1, r2, init1, init2, out1, out2
+    # eta, eps, kap, d1, d2, r1, r2, init1, init2, out1, out2
     [np.pi, np.pi, np.pi, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
 )
 
@@ -205,6 +205,18 @@ X_SCALE = np.array([1e-2, 1e-2, 1e-2, 1e-3, 1e-3, 1e-3, 1e-3])
 MIN_WEIGHT_PROB = 1e-12
 
 
+def construct_full_params(x: np.ndarray, fixed_params: dict | None):
+    x_full = []
+    idx = 0
+    for param in PARAM_NAMES:
+        if param in fixed_params:
+            x_full.append(fixed_params[param])
+        else:
+            x_full.append(x[idx])
+            idx += 1
+    return x_full
+
+
 def residuals(
     x: np.ndarray,
     n: np.ndarray,
@@ -212,6 +224,7 @@ def residuals(
     shots: int,
     weight_probs: np.ndarray | None = None,
     generator_basis: np.ndarray = _GENERATOR_BASIS,
+    fixed_params: dict | None = None,
 ) -> np.ndarray:
     """Whitened residual vector for `least_squares`.
 
@@ -231,7 +244,8 @@ def residuals(
         "use the model prediction at `x`", so the weights track the current estimate.
         Pass an array to hold them fixed, as the iterated GLS passes in `fit_joint` do.
     """
-    model_data = get_fidelities(n, *x, generator_basis=generator_basis).real
+    x_full = construct_full_params(x, fixed_params)
+    model_data = get_fidelities(n, *x_full, generator_basis=generator_basis).real
     probs = model_data if weight_probs is None else weight_probs
     diffs = model_data - data
     return (
@@ -246,13 +260,15 @@ def _run_least_squares(
     shots: int,
     weight_probs: np.ndarray | None = None,
     generator_basis: np.ndarray = _GENERATOR_BASIS,
+    fixed_params: dict | None = None,
+    lower_bounds: np.ndarray = LOWER_BOUNDS,
+    upper_bounds: np.ndarray = UPPER_BOUNDS,
 ):
     return least_squares(
         residuals,
         x0,
-        args=(n, data, shots, weight_probs, generator_basis),
-        bounds=(LOWER_BOUNDS, UPPER_BOUNDS),
-        # x_scale=X_SCALE,
+        args=(n, data, shots, weight_probs, generator_basis, fixed_params),
+        bounds=(lower_bounds, upper_bounds),
         xtol=1e-8,
         ftol=1e-8,
         gtol=1e-8,
