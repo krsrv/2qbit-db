@@ -22,70 +22,18 @@ HERE = Path(__file__).resolve().parent
 
 STATES = ["++", "+-", "-+", "--"]
 CSV_COLUMN_FOR_STATE = {"++": "pp", "+-": "pm", "-+": "mp", "--": "mm"}
-PARAM_NAMES = ["eta", "eps", "kap", "d1", "d2", "r1", "r2", "p1", "p2", "p3", "p4"]
-
-# Every fidelity is (1/16) * sum_k c_k * mode_k ** n over the same 13 modes; only the
-# coefficients c_k depend on the state. The modes are 6 conjugate pairs
-# (amplitude * exp(-i*phi), amplitude * exp(+i*phi)) followed by the constant/DC mode,
-# in the same order as MODE_GROUPS in least_squares_fitting.py.
-MODE_KEYS = [
-    "eps_eta",  # d1^4,       phi = 8 (eps + eta)
-    "eta_kap",  # d2^4,       phi = 8 (eta + kap)
-    "eps_m_kap",  # d1^4 d2^4,  phi = 8 (eps - kap)
-    "eps_p_kap",  # d1^4 d2^4,  phi = 8 (eps + kap)
-    "eta_m_kap",  # r1^4 d2^4,  phi = 8 (eta - kap)
-    "eps_m_eta",  # d1^4 r2^4,  phi = 8 (eps - eta)
-]
-
-
-def _state_coefficients(state: str) -> np.ndarray:
-    """Row of 13 coefficients for `state`, one per mode (pairs share a sign)."""
-    s1 = 1.0 if state[0] == "+" else -1.0
-    s2 = 1.0 if state[1] == "+" else -1.0
-    # per-group sign, in MODE_KEYS order
-    group_signs = [s1, s2, s1 * s2, s1 * s2, s2, s1]
-    return np.array([s for s in group_signs for _ in (0, 1)] + [4.0])
-
-
-# (4, 13): one row per state, rows ordered as STATES
-COEFF_MATRIX = np.array([_state_coefficients(state) for state in STATES])
-STATE_COEFFS = dict(zip(STATES, COEFF_MATRIX))
-
-
-def mode_values(eta, eps, kap, d1, d2, r1, r2) -> np.ndarray:
-    """The 13 complex per-step modes, ordered to match the columns of COEFF_MATRIX."""
-    amplitudes = np.array(
-        [
-            d1**4,
-            d2**4,
-            (d1**4) * (d2**4),
-            (d1**4) * (d2**4),
-            (r1**4) * (d2**4),
-            (d1**4) * (r2**4),
-        ]
-    )
-    phases = 8.0 * np.array(
-        [eps + eta, eta + kap, eps - kap, eps + kap, eta - kap, eps - eta]
-    )
-    # (6, 2) -> conjugate pair per group, then flattened and given the DC mode
-    pairs = amplitudes[:, None] * np.exp(1j * np.array([-1.0, 1.0]) * phases[:, None])
-    return np.concatenate([pairs.reshape(-1), [1.0 + 0j]])
-
+PARAM_NAMES = ["eta", "eps", "kap", "d1", "d2", "r1", "r2", "ep1", "em1", "ep2", "em2"]
 
 # ---------------------------------------------------------------------------
 # Vectorized Lindblad generator of one repetition
 # ---------------------------------------------------------------------------
 
 I2 = np.eye(2)
+SIGMA_X = np.array([[0.0, 1.0], [1.0, 0.0]])
+SIGMA_Y = np.array([[0.0, -1.0j], [1.0j, 0.0]])
 SIGMA_Z = np.array([[1.0, 0.0], [0.0, -1.0]])
 H = 1 / np.sqrt(2) * np.array([[1.0, 1.0], [1.0, -1.0]])
 SIGMA_MINUS = np.array([[0.0, 1.0], [0.0, 0.0]])  # lowering operator
-
-IDEAL_MSMT_OPS = np.zeros((4, 4, 4))
-for i in range(4):
-    IDEAL_MSMT_OPS[i, i, i] = 1
-    IDEAL_MSMT_OPS[i] = np.kron(H, H) @ IDEAL_MSMT_OPS[i] @ np.kron(H, H)
-IDEAL_MSMT_OPS = IDEAL_MSMT_OPS.reshape(4, -1)
 
 
 def _on(m: np.ndarray, qubit: int) -> np.ndarray:
@@ -122,10 +70,27 @@ _GENERATOR_BASIS = np.array(
         _dissipator_super(2.0 * _on(SIGMA_MINUS, 1)),  # scaled by r2
     ],
     dtype=complex,
-).reshape(7, -1)
+)
 
 
-def construct_unit_operator(eta, eps, kap, d1, d2, r1, r2) -> np.ndarray:
+def construct_generator_basis(op1, op2, op3):
+    return np.array(
+        [
+            _hamiltonian_super(op1),  # eta
+            _hamiltonian_super(op2),  # eps
+            _hamiltonian_super(op3),  # kap
+            _dissipator_super(0.5 * _on(SIGMA_Z, 0)),  # scaled by d1
+            _dissipator_super(0.5 * _on(SIGMA_Z, 1)),  # scaled by d2
+            _dissipator_super(2.0 * _on(SIGMA_MINUS, 0)),  # scaled by r1
+            _dissipator_super(2.0 * _on(SIGMA_MINUS, 1)),  # scaled by r2
+        ],
+        dtype=complex,
+    )
+
+
+def construct_unit_operator(
+    eta, eps, kap, d1, d2, r1, r2, generator_basis: np.ndarray = _GENERATOR_BASIS
+) -> np.ndarray:
     """The (16, 16) Lindblad generator of one time step as a superoperator.
 
     - vec(A rho B) = kron(A, B.T)
@@ -134,23 +99,47 @@ def construct_unit_operator(eta, eps, kap, d1, d2, r1, r2) -> np.ndarray:
     - c_k = 1/2 d1 Z_1, 1/2 d2 Z_2, 2 r1 sigma^-_1, 2 r2 sigma^-_2
     """
     coefficients = np.array([eta, eps, kap, d1, d2, r1, r2], dtype=complex)
-    return (_GENERATOR_BASIS.T @ coefficients).reshape(16, 16)
+    return (generator_basis.reshape(7, -1).T @ coefficients).reshape(16, 16)
 
 
-def construct_init_state(init1, init2):
-    confusion = np.outer([init1, 1 - init1], [init2, 1 - init2]).reshape(-1)
-    return confusion @ IDEAL_MSMT_OPS
+def construct_ideal_msmt_ops(rot: np.ndarray = None) -> np.ndarray:
+    """The four ideal projectors, rotated into the measured basis by `rot`.
+
+    `rot = kron(H, H)` gives the X basis (the default), `rot = None` the Z basis.
+    """
+    ops = np.zeros((4, 4, 4), dtype=complex)
+    for i in range(4):
+        ops[i, i, i] = 1.0
+        if rot is not None:
+            ops[i] = rot.conj().T @ ops[i] @ rot
+    return ops.reshape(4, -1)
 
 
-def construct_msmt_op(out1, out2):
-    a = np.array([[out1, 1 - out1], [1 - out1, out1]])
-    b = np.array([[out2, 1 - out2], [1 - out2, out2]])
-    confusion = (a[:, None, :, None] * b[None, :, None, :]).reshape(4, 4)  # kron(a, b)
-    return confusion @ IDEAL_MSMT_OPS
+def construct_init_state():
+    return construct_ideal_msmt_ops()[0]
+
+
+def construct_msmt_op(ep1, em1, ep2, em2):
+    a = np.array([[1 - ep1, em1], [ep1, 1 - em1]])
+    b = np.array([[1 - ep2, em2], [ep2, 1 - em2]])
+    confusion = (a[:, None, :, None] * b[None, :, None, :]).reshape(4, 4)
+    return confusion @ construct_ideal_msmt_ops()
 
 
 def get_fidelities(
-    n, eta, eps, kap, d1, d2, r1, r2, init1, init2, out1, out2
+    n,
+    eta,
+    eps,
+    kap,
+    d1,
+    d2,
+    r1,
+    r2,
+    ep1,
+    em1,
+    ep2,
+    em2,
+    generator_basis: np.ndarray = _GENERATOR_BASIS,
 ) -> np.ndarray:
     """
     All four fidelities at once, shape (len(n), 4) with columns ordered as `STATES`.
@@ -161,8 +150,7 @@ def get_fidelities(
         eta, eps, kap: Phase parameters for (ZZ, ZI, IZ).
         d1, d2: Dephasing rates (sigma_z/2).
         r1, r2: Relaxation rates (2 sigma_-).
-        init1, init2: Flip probabilities in initial state prep for each qubit
-        out1, out2: POVM mixing rates for each qubit
+        ep1, em1, ep2, em2: Asymmetric confusion matrix
 
     Returns:
         Array of shape (len(n), 4): fidelities for each computational basis state at each n.
@@ -171,9 +159,11 @@ def get_fidelities(
         n = np.arange(n)
     n = np.asarray(n, dtype=float)
 
-    unit_op = construct_unit_operator(eta, eps, kap, d1, d2, r1, r2)
-    state = construct_init_state(init1, init2).astype(complex)
-    msmt_ops = construct_msmt_op(out1, out2)
+    unit_op = construct_unit_operator(
+        eta, eps, kap, d1, d2, r1, r2, generator_basis=generator_basis
+    )
+    state = construct_init_state().astype(complex)
+    msmt_ops = construct_msmt_op(ep1, em1, ep2, em2)
 
     # exp(G t) s0 = V diag(exp(w t)) V^-1 s0, so one eigendecomposition of the (16, 16)
     # generator gives *every* time step: fold V^-1 s0 and msmt_ops @ V into a single
@@ -197,11 +187,11 @@ def get_fidelities(
 
 LOWER_BOUNDS = np.array(
     # n, eta, eps, kap, d1, d2, r1, r2, init1, init2, out1, out2
-    [-np.pi, -np.pi, -np.pi, 0.0, 0.0, 0.0, 0.0, 0.9, 0.9, 0.9, 0.9]
+    [-np.pi, -np.pi, -np.pi, -0.1, -0.1, -0.1, -0.1, 0.0, 0.0, 0.0, 0.0]
 )
 UPPER_BOUNDS = np.array(
     # n, eta, eps, kap, d1, d2, r1, r2, init1, init2, out1, out2
-    [np.pi, np.pi, np.pi, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    [np.pi, np.pi, np.pi, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
 )
 
 
@@ -221,6 +211,7 @@ def residuals(
     data: np.ndarray,
     shots: int,
     weight_probs: np.ndarray | None = None,
+    generator_basis: np.ndarray = _GENERATOR_BASIS,
 ) -> np.ndarray:
     """Whitened residual vector for `least_squares`.
 
@@ -240,7 +231,7 @@ def residuals(
         "use the model prediction at `x`", so the weights track the current estimate.
         Pass an array to hold them fixed, as the iterated GLS passes in `fit_joint` do.
     """
-    model_data = get_fidelities(n, *x).real
+    model_data = get_fidelities(n, *x, generator_basis=generator_basis).real
     probs = model_data if weight_probs is None else weight_probs
     diffs = model_data - data
     return (
@@ -254,11 +245,12 @@ def _run_least_squares(
     data: np.ndarray,
     shots: int,
     weight_probs: np.ndarray | None = None,
+    generator_basis: np.ndarray = _GENERATOR_BASIS,
 ):
     return least_squares(
         residuals,
         x0,
-        args=(n, data, shots, weight_probs),
+        args=(n, data, shots, weight_probs, generator_basis),
         bounds=(LOWER_BOUNDS, UPPER_BOUNDS),
         # x_scale=X_SCALE,
         xtol=1e-8,
@@ -318,7 +310,7 @@ def fit_joint(
                 [
                     rng.uniform(0.0, 0.02, size=3),
                     rng.uniform(0.0, 0.003, size=4),
-                    rng.uniform(0.99, 1.0, size=4),
+                    rng.uniform(0.0, 0.1, size=4),
                 ]
             )
         result = _run_least_squares(x0_trial, curr_n, curr_data, shots)
@@ -331,7 +323,6 @@ def fit_joint(
             drop_idx = rng.integers(0, n.shape[0], k)
             curr_n = np.delete(n, drop_idx)
             curr_data = np.delete(data, drop_idx, axis=0)
-            weight_probs = np.clip(curr_data, 1e-6, None)
         if idx >= (4 ** (k + 1)) * n_restarts:
             k += 1
         idx += 1
