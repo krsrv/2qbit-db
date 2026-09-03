@@ -1,5 +1,6 @@
 import itertools
 import re
+from functools import lru_cache
 from pathlib import Path
 from typing import NamedTuple
 
@@ -8,6 +9,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 from matplotlib.backends.backend_pdf import PdfPages
+from scipy.linalg import expm
 from scipy.optimize import least_squares
 
 from get_error_bars import canonicalize_signs
@@ -17,9 +19,13 @@ from least_squares import (
     SIGMA_X,
     SIGMA_Y,
     SIGMA_Z,
+    H,
+    _hamiltonian_super,
     _on,
     construct_full_params,
     construct_generator_basis,
+    construct_init_state,
+    construct_msmt_op,
     get_fidelities,
     residuals,
 )
@@ -290,6 +296,178 @@ def construct_init_values(
     return params
 
 
+# cond(V) past which an `eig` basis is too ill-conditioned to exponentiate through,
+# so `evolve` falls back to scaling-and-squaring instead.
+_MAX_EIGENBASIS_COND = 1e8
+
+
+@lru_cache(maxsize=8)
+def _eigendecompose(key: bytes, dim: int) -> tuple[np.ndarray, np.ndarray, str]:
+    """Eigendecomposition of the (dim, dim) complex matrix whose buffer is `key`.
+
+    Returns (eigenvalues, eigenvectors, mode), where mode tells `evolve` how to
+    reassemble the propagator: "unitary" if the eigenbasis is orthonormal, "solve" if
+    it has to be inverted, "expm" if it is too ill-conditioned to use at all (then the
+    first two entries are None).
+
+    Keyed on the raw bytes so that repeated calls with the *same* Liouvillian at
+    different times share one decomposition; the arrays are handed out read-only
+    because every caller gets the same objects back.
+    """
+    L = np.frombuffer(key, dtype=complex).reshape(dim, dim)
+    # Use `eigh` on Hermitian and anti-Hermitian superoperators to avould singularities
+    # in calculating eigenvalues.
+    if np.allclose(L, -L.conj().T):
+        mu, eigenvectors = np.linalg.eigh(1j * L)
+        eigenvalues, mode = -1j * mu, "unitary"
+    elif np.allclose(L, L.conj().T):
+        values, eigenvectors = np.linalg.eigh(L)
+        eigenvalues, mode = values.astype(complex), "unitary"
+    else:
+        # Usually for the dissipator.
+        eigenvalues, eigenvectors = np.linalg.eig(L)
+        if np.linalg.cond(eigenvectors) > _MAX_EIGENBASIS_COND:
+            return None, None, "expm"
+        mode = "solve"
+    eigenvalues.flags.writeable = False
+    eigenvectors.flags.writeable = False
+    return eigenvalues, eigenvectors, mode
+
+
+def evolve(L: np.ndarray, t: float):
+    """Given a time-constant Louivillian in superoperator form (d^2 x d^2), get the propogator for
+    corresponding to time t"""
+    # exp(L t) = V diag(exp(w t)) V^-1
+    # Scale the columns of V by exp(w t) and solve against V.T rather than forming
+    # V^-1. Same trick as `get_fidelities`.
+    #
+    # It also amortizes across calls: `gate_residual` evolves one dissipator at
+    # tq_gt once and at sq_gt three times, and the cache turns those four calls into a
+    # single eig.
+    L = np.ascontiguousarray(L, dtype=complex)
+    eigenvalues, eigenvectors, mode = _eigendecompose(L.tobytes(), L.shape[0])
+    if mode == "expm":
+        return expm(L * t)
+    scaled = eigenvectors * np.exp(eigenvalues * t)
+    if mode == "unitary":
+        return scaled @ eigenvectors.conj().T
+    return np.linalg.solve(eigenvectors.T, scaled.T).T
+
+
+# vec form of rho -> CZ rho CZ^dag, i.e. kron(CZ, CZ.conj()).
+CZ_SUPER = np.kron(np.diag([1.0, 1.0, 1.0, -1.0]), np.diag([1.0, 1.0, 1.0, -1.0]))
+
+
+def new_gate_fidelities(
+    n,
+    eta,
+    eps,
+    kap,
+    d1,
+    d2,
+    r1,
+    r2,
+    ep1,
+    em1,
+    ep2,
+    em2,
+    generator_basis: np.ndarray = _GENERATOR_BASIS,
+):
+    if isinstance(n, (int, np.integer)):
+        n = np.arange(n)
+    n = np.asarray(n, dtype=float)
+
+    sq_gt = 35
+    tq_gt = 65
+    # Set 1
+    dissipator = 1e-3 * (
+        d1 * SET1_BASIS[3]
+        + d2 * SET1_BASIS[4]
+        + r1 * SET1_BASIS[5]
+        + r2 * SET1_BASIS[6]
+    )
+    cz = (
+        evolve(dissipator, tq_gt)
+        @ evolve(
+            eta * _hamiltonian_super(np.kron(SIGMA_Z, SIGMA_Z))
+            + eps * _hamiltonian_super(np.kron(SIGMA_Z, np.eye(2)))
+            + kap * _hamiltonian_super(np.kron(np.eye(2), SIGMA_Z)),
+            1,
+        )
+        # @ CZ_SUPER
+    )
+    xi = evolve(dissipator, sq_gt) @ np.kron(
+        np.kron(SIGMA_X, np.eye(2)), np.kron(SIGMA_X, np.eye(2))
+    )
+    ix = evolve(dissipator, sq_gt) @ np.kron(
+        np.kron(np.eye(2), SIGMA_X), np.kron(np.eye(2), SIGMA_X)
+    )
+    hh = evolve(dissipator, sq_gt) @ np.kron(np.kron(H, H), np.kron(H, H))
+    unit_op = ix @ (hh @ cz @ hh) @ xi @ (hh @ cz @ hh)
+    unit_op = unit_op @ unit_op
+
+    # Set 2
+    # dissipator = 1e-3 * (
+    #     d1 * SET1_BASIS[3]
+    #     + d2 * SET1_BASIS[4]
+    #     + r1 * SET1_BASIS[5]
+    #     + r2 * SET1_BASIS[6]
+    # )
+    # cz = (
+    #     evolve(dissipator, tq_gt)
+    #     @ evolve(
+    #         eta * _hamiltonian_super(np.kron(SIGMA_Y, SIGMA_Y))
+    #         + eps * _hamiltonian_super(np.kron(SIGMA_Y, np.eye(2)))
+    #         + kap * _hamiltonian_super(np.kron(np.eye(2), SIGMA_Y)),
+    #         1,
+    #     )
+    #     # @ CZ_SUPER
+    # )
+    # yi = evolve(dissipator, sq_gt) @ np.kron(
+    #     np.kron(SIGMA_Y, np.eye(2)), np.kron(SIGMA_Y, np.eye(2))
+    # )
+    # iy = evolve(dissipator, sq_gt) @ np.kron(
+    #     np.kron(np.eye(2), SIGMA_Y), np.kron(np.eye(2), SIGMA_Y)
+    # )
+    # unit_op = iy @ cz @ yi @ cz
+    # unit_op = unit_op @ unit_op
+
+    state = construct_init_state().astype(complex)
+    msmt_ops = construct_msmt_op(ep1, em1, ep2, em2)
+
+    # `unit_op` is the propagator of one repetition, so n repetitions is the matrix
+    # *power* unit_op**n = V diag(w**n) V^-1
+    eigenvalues, eigenvectors = np.linalg.eig(unit_op)
+    weights = (msmt_ops @ eigenvectors) * np.linalg.solve(eigenvectors, state)
+    return np.real((eigenvalues ** n[:, None]) @ weights.T)
+
+
+def gate_residuals(
+    x: np.ndarray,
+    n: np.ndarray,
+    data: np.ndarray,
+    shots: int,
+    weight_probs: np.ndarray | None = None,
+    generator_basis: np.ndarray = _GENERATOR_BASIS,
+    fixed_params: dict | None = None,
+) -> np.ndarray:
+    x_full = construct_full_params(x, fixed_params)
+    model_data = new_gate_fidelities(n, *x_full, generator_basis=generator_basis).real
+
+    probs = model_data if weight_probs is None else weight_probs
+    diffs = model_data - data
+    return (np.sqrt(shots) * diffs / np.sqrt(np.clip(probs, 1e-6, None))).reshape(-1)
+
+
+method = "model_dd"
+if method == "model_dd":
+    residual_fn = gate_residuals  # residuals
+    fidelity_fn = new_gate_fidelities  # get_fidelities
+else:
+    residual_fn = residuals
+    fidelity_fn = get_fidelities
+
+
 def _run_least_squares(
     x0: np.ndarray,
     n: np.ndarray,
@@ -302,7 +480,7 @@ def _run_least_squares(
     upper_bounds: np.ndarray = UPPER_BOUNDS,
 ):
     return least_squares(
-        residuals,
+        residual_fn,
         x0,
         args=(n, data, shots, weight_probs, generator_basis, fixed_params),
         bounds=(lower_bounds, upper_bounds),
@@ -329,7 +507,7 @@ def _gls_refine(
     """
     for _ in range(GLS_PASSES):
         x = construct_full_params(result.x, fixed_params)
-        weight_probs = get_fidelities(n, *x, generator_basis=generator_basis).real
+        weight_probs = fidelity_fn(n, *x, generator_basis=generator_basis).real
         refined = _run_least_squares(
             result.x,
             n,
@@ -379,25 +557,43 @@ def construct_x_trial(
     # eta, eps, kap | d1, d2, r1, r2 | ep1, em1, ep2, em2
     discard_idx = [i for i, name in enumerate(PARAM_NAMES) if name in fixed_params]
     if x0 is None:
-        x0_trial = np.concatenate(
-            [
-                rng.uniform(0.0, 0.02, size=3),
-                rng.uniform(0.0, 0.003, size=4),
-                rng.uniform(0.0, 0.2, size=4),
-            ]
-        )
+        if method == "model_dd":
+            x0_trial = np.concatenate(
+                [
+                    rng.uniform(0.0, 0.02, size=3),
+                    rng.uniform(0.0, 1 / 100, size=4),
+                    rng.uniform(0.0, 0.2, size=4),
+                ]
+            )
+        else:
+            x0_trial = np.concatenate(
+                [
+                    rng.uniform(0.0, 0.02, size=3),
+                    rng.uniform(0.0, 0.003, size=4),
+                    rng.uniform(0.0, 0.2, size=4),
+                ]
+            )
         if discard_idx:
             x0_trial = np.delete(x0_trial, discard_idx)
     elif attempt == 0:
         x0_trial = np.asarray(x0, dtype=float)
     else:
-        perturb = np.concatenate(
-            [
-                rng.uniform(0, 0.01, size=3),
-                rng.uniform(0, 0.001, size=4),
-                rng.uniform(0, 0.001, size=4),
-            ]
-        )
+        if method == "model_dd":
+            perturb = np.concatenate(
+                [
+                    rng.uniform(0, 0.01, size=3),
+                    rng.uniform(0, 0.01, size=4),
+                    rng.uniform(0, 0.001, size=4),
+                ]
+            )
+        else:
+            perturb = np.concatenate(
+                [
+                    rng.uniform(0, 0.01, size=3),
+                    rng.uniform(0, 0.001, size=4),
+                    rng.uniform(0, 0.001, size=4),
+                ]
+            )
         if discard_idx:
             perturb = np.delete(perturb, discard_idx)
         x0_trial = np.asarray(x0, dtype=float) + perturb
@@ -453,7 +649,7 @@ def fit_family(
     param_names = [name for name in PARAM_NAMES if name not in fixed_params]
     params = dict(zip(param_names, best.x))
     params["true_cost"] = 0.5 * np.sum(
-        residuals(
+        residual_fn(
             best.x,
             n,
             data,
@@ -506,15 +702,15 @@ def generator_basis_for(label: str) -> np.ndarray:
 
 
 def fixed_params_for(label: str) -> dict:
-    if "set1" in label:
-        return {"r1": 0.0, "r2": 0.0}
+    # if "set1" in label:
+    #     return {"r1": 0.0, "r2": 0.0}
     return {}
 
 
 def bounds_for(label: str) -> tuple[np.ndarray, np.ndarray]:
-    if "set1" in label:
-        keep_idx = [i for i, name in enumerate(PARAM_NAMES) if name not in ["r1", "r2"]]
-        return LOWER_BOUNDS[keep_idx], UPPER_BOUNDS[keep_idx]
+    # if "set1" in label:
+    #     keep_idx = [i for i, name in enumerate(PARAM_NAMES) if name not in ["r1", "r2"]]
+    #     return LOWER_BOUNDS[keep_idx], UPPER_BOUNDS[keep_idx]
     return LOWER_BOUNDS, UPPER_BOUNDS
 
 
@@ -587,7 +783,7 @@ def plot_family(
     """
     dense_n = np.linspace(float(np.min(family.n)), float(np.max(family.n)), PLOT_POINTS)
     x = construct_full_params(params, fixed_params)
-    model = get_fidelities(dense_n, *x, generator_basis=generator_basis).real
+    model = fidelity_fn(dense_n, *x, generator_basis=generator_basis).real
     fig, axes = plt.subplots(1, 4, figsize=(16, 3.4), sharex=True, sharey=True)
     for idx, (ax, ss) in enumerate(zip(axes, JOINT_STATES)):
         errs = family.errs[:, idx]
@@ -615,8 +811,7 @@ def plot_family(
 def analyze_experiments(data_path: Path, seed: int = 1, output_dir: Path = OUTPUT_DIR):
     if not data_path.exists():
         raise FileNotFoundError(
-            f"{data_path} does not exist. Pass --data pointing at an unpacked node "
-            f"directory's ds_raw.h5 (the .zip archives under data/ hold them)."
+            f"{data_path} does not exist. Pass --data pointing at an h5 file."
         )
     ds_raw = xr.open_dataset(data_path)
     print("raw vars:", list(ds_raw.data_vars))
@@ -639,6 +834,8 @@ def analyze_experiments(data_path: Path, seed: int = 1, output_dir: Path = OUTPU
             }
         )
         for idx, family in enumerate(families):
+            if idx != 0:
+                continue
             family_rows, _ = process_single_family(family, rng)
             rows.extend(family_rows)
 
