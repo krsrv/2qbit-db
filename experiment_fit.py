@@ -229,6 +229,30 @@ def iter_families(ds: xr.Dataset) -> list[Family]:
     return families
 
 
+def _decay_init(gate_time: float, t2: list, t1: list) -> list:
+    """Initial (d1, d2, r1, r2) values.
+
+    `new_gate_fidelities` integrates the dissipator over the real gate durations in ns,
+    so its d and r are absolute rates, instead of per-repetition fractions. The jump operator
+    d/2 Z damps coherences at d * 1e-3 / 2, and 2 r sigma^- damps populations at
+    4 r * 1e-3. Inverting those gives d = 2000 / T_phi and r = 250 / T1, where
+    1 / T_phi = 1 / T2 - 1 / (2 T1).
+    """
+    if method == "model_dd":
+        return [
+            2000 * (1 / t2[0] - 1 / (2 * t1[0])),
+            2000 * (1 / t2[1] - 1 / (2 * t1[1])),
+            250 / t1[0],
+            250 / t1[1],
+        ]
+    return [
+        gate_time / t2[0],
+        gate_time / t2[1],
+        gate_time / t1[0],
+        gate_time / t1[1],
+    ]
+
+
 def construct_init_values(
     family: Family, rng: np.random.Generator, fixed_params: dict
 ) -> np.ndarray:
@@ -253,14 +277,9 @@ def construct_init_values(
             [
                 rng.uniform(0, 0.01, size=1),
                 rng.uniform(0, 0.1, size=2),
-                [
-                    # zi,
-                    # iz,
-                    gate_time / t2[0],
-                    gate_time / t2[1],
-                    gate_time / t1[0],
-                    gate_time / t1[1],
-                ],
+                # zi,
+                # iz,
+                _decay_init(gate_time, t2, t1),
             ]
         )
 
@@ -269,12 +288,7 @@ def construct_init_values(
         params = np.concatenate(
             [
                 rng.uniform(0, 0.01, size=3),
-                [
-                    gate_time / t2[0],
-                    gate_time / t2[1],
-                    gate_time / t1[0],
-                    gate_time / t1[1],
-                ],
+                _decay_init(gate_time, t2, t1),
             ]
         )
     elif ("set4" in family.label) or ("set5" in family.label):
@@ -282,12 +296,15 @@ def construct_init_values(
         params = np.concatenate(
             [
                 rng.uniform(0, 0.01, size=3),
-                [
-                    gate_time / t2[0],
-                    gate_time / t2[1],
-                    gate_time / t1[0],
-                    gate_time / t1[1],
-                ],
+                _decay_init(gate_time, t2, t1),
+            ]
+        )
+    elif family.label == "qubit_pairq3-6":
+        gate_time = 60
+        params = np.concatenate(
+            [
+                rng.uniform(0, 0.01, size=3),
+                _decay_init(gate_time, t2, t1),
             ]
         )
     params = np.concatenate([params, rng.uniform(0, 0.1, size=4)])
@@ -356,8 +373,10 @@ def evolve(L: np.ndarray, t: float):
 
 # vec form of rho -> CZ rho CZ^dag, i.e. kron(CZ, CZ.conj()).
 CZ_SUPER = np.kron(np.diag([1.0, 1.0, 1.0, -1.0]), np.diag([1.0, 1.0, 1.0, -1.0]))
+SQ_GT, TQ_GT = 30, 60
 
 
+# da319f58-1f7c-4a18-8501-f6d1c9695a4d
 def new_gate_fidelities(
     n,
     eta,
@@ -377,9 +396,7 @@ def new_gate_fidelities(
         n = np.arange(n)
     n = np.asarray(n, dtype=float)
 
-    sq_gt = 35
-    tq_gt = 65
-    # Set 1
+    # Set 0 "qubit_pairq3" (no DD experiment)
     dissipator = 1e-3 * (
         d1 * SET1_BASIS[3]
         + d2 * SET1_BASIS[4]
@@ -387,24 +404,46 @@ def new_gate_fidelities(
         + r2 * SET1_BASIS[6]
     )
     cz = (
-        evolve(dissipator, tq_gt)
+        evolve(dissipator, TQ_GT)
         @ evolve(
             eta * _hamiltonian_super(np.kron(SIGMA_Z, SIGMA_Z))
             + eps * _hamiltonian_super(np.kron(SIGMA_Z, np.eye(2)))
             + kap * _hamiltonian_super(np.kron(np.eye(2), SIGMA_Z)),
             1,
         )
-        # @ CZ_SUPER
+        @ CZ_SUPER
     )
-    xi = evolve(dissipator, sq_gt) @ np.kron(
-        np.kron(SIGMA_X, np.eye(2)), np.kron(SIGMA_X, np.eye(2))
-    )
-    ix = evolve(dissipator, sq_gt) @ np.kron(
-        np.kron(np.eye(2), SIGMA_X), np.kron(np.eye(2), SIGMA_X)
-    )
-    hh = evolve(dissipator, sq_gt) @ np.kron(np.kron(H, H), np.kron(H, H))
-    unit_op = ix @ (hh @ cz @ hh) @ xi @ (hh @ cz @ hh)
+    unit_op = cz @ cz
     unit_op = unit_op @ unit_op
+    rot = np.kron(H, H)
+
+    # Set 1
+    # dissipator = 1e-3 * (
+    #     d1 * SET1_BASIS[3]
+    #     + d2 * SET1_BASIS[4]
+    #     + r1 * SET1_BASIS[5]
+    #     + r2 * SET1_BASIS[6]
+    # )
+    # cz = (
+    #     evolve(dissipator, TQ_GT)
+    #     @ evolve(
+    #         eta * _hamiltonian_super(np.kron(SIGMA_Z, SIGMA_Z))
+    #         + eps * _hamiltonian_super(np.kron(SIGMA_Z, np.eye(2)))
+    #         + kap * _hamiltonian_super(np.kron(np.eye(2), SIGMA_Z)),
+    #         1,
+    #     )
+    #     # @ CZ_SUPER
+    # )
+    # xi = evolve(dissipator, SQ_GT) @ np.kron(
+    #     np.kron(SIGMA_X, np.eye(2)), np.kron(SIGMA_X, np.eye(2))
+    # )
+    # ix = evolve(dissipator, SQ_GT) @ np.kron(
+    #     np.kron(np.eye(2), SIGMA_X), np.kron(np.eye(2), SIGMA_X)
+    # )
+    # hh = evolve(dissipator, SQ_GT) @ np.kron(np.kron(H, H), np.kron(H, H))
+    # unit_op = ix @ (hh @ cz @ hh) @ xi @ (hh @ cz @ hh)
+    # unit_op = unit_op @ unit_op
+    # rot = None
 
     # Set 2
     # dissipator = 1e-3 * (
@@ -414,7 +453,7 @@ def new_gate_fidelities(
     #     + r2 * SET1_BASIS[6]
     # )
     # cz = (
-    #     evolve(dissipator, tq_gt)
+    #     evolve(dissipator, TQ_GT)
     #     @ evolve(
     #         eta * _hamiltonian_super(np.kron(SIGMA_Y, SIGMA_Y))
     #         + eps * _hamiltonian_super(np.kron(SIGMA_Y, np.eye(2)))
@@ -423,17 +462,18 @@ def new_gate_fidelities(
     #     )
     #     # @ CZ_SUPER
     # )
-    # yi = evolve(dissipator, sq_gt) @ np.kron(
+    # yi = evolve(dissipator, SQ_GT) @ np.kron(
     #     np.kron(SIGMA_Y, np.eye(2)), np.kron(SIGMA_Y, np.eye(2))
     # )
-    # iy = evolve(dissipator, sq_gt) @ np.kron(
+    # iy = evolve(dissipator, SQ_GT) @ np.kron(
     #     np.kron(np.eye(2), SIGMA_Y), np.kron(np.eye(2), SIGMA_Y)
     # )
     # unit_op = iy @ cz @ yi @ cz
     # unit_op = unit_op @ unit_op
+    # rot = None
 
-    state = construct_init_state().astype(complex)
-    msmt_ops = construct_msmt_op(ep1, em1, ep2, em2)
+    state = construct_init_state(rot).astype(complex)
+    msmt_ops = construct_msmt_op(ep1, em1, ep2, em2, rot=rot)
 
     # `unit_op` is the propagator of one repetition, so n repetitions is the matrix
     # *power* unit_op**n = V diag(w**n) V^-1
@@ -463,7 +503,7 @@ method = "model_dd"
 if method == "model_dd":
     residual_fn = gate_residuals  # residuals
     fidelity_fn = new_gate_fidelities  # get_fidelities
-else:
+elif method == "mix":
     residual_fn = residuals
     fidelity_fn = get_fidelities
 
@@ -698,6 +738,8 @@ def generator_basis_for(label: str) -> np.ndarray:
         return SET4_BASIS
     if "set5" in label:
         return SET4_BASIS
+    if "qubit_pairq3-6" == label:
+        return SET1_BASIS
     raise RuntimeError(f"Set1-5 are the only recognized labels. Received {label}")
 
 
