@@ -22,7 +22,20 @@ HERE = Path(__file__).resolve().parent
 
 STATES = ["++", "+-", "-+", "--"]
 CSV_COLUMN_FOR_STATE = {"++": "pp", "+-": "pm", "-+": "mp", "--": "mm"}
-PARAM_NAMES = ["eta", "eps", "kap", "d1", "d2", "r1", "r2", "ep1", "em1", "ep2", "em2"]
+PARAM_NAMES = [
+    "eta",
+    "eps",
+    "kap",
+    "d1",
+    "d2",
+    "r1",
+    "r2",
+    "ep1",
+    "em1",
+    "ep2",
+    "em2",
+    "phi",
+]
 
 # ---------------------------------------------------------------------------
 # Vectorized Lindblad generator of one repetition
@@ -43,15 +56,88 @@ def _on(m: np.ndarray, qubit: int) -> np.ndarray:
 
 def _hamiltonian_super(h: np.ndarray) -> np.ndarray:
     """Superoperator of -i [h, .], using vec(A rho B) = kron(A, B.T)."""
-    eye = np.eye(4)
+    eye = np.eye(len(h))
     return -1j * (np.kron(h, eye) - np.kron(eye, h.T))
 
 
 def _dissipator_super(c: np.ndarray) -> np.ndarray:
     """Superoperator of c rho c^dag - {c^dag c, rho} / 2, for jump operator `c`."""
-    eye = np.eye(4)
+    eye = np.eye(len(c))
     num = c.conj().T @ c  # c^dag c
     return np.kron(c, c.conj()) - 0.5 * (np.kron(num, eye) + np.kron(eye, num.T))
+
+
+# ---------------------------------------------------------------------------
+# Level structure
+# ---------------------------------------------------------------------------
+
+QUBIT_LEVELS = (2, 2)
+
+# Readout bins every leakage level with this computational level: a transmon
+# discriminator lands |2> in the |1> window far more often than the |0> one.
+LEAK_READOUT_LEVEL = 1
+
+
+def _number(d: int) -> np.ndarray:
+    """Number operator diag(0, 1, ..., d-1).
+
+    Its dissipator dephases the 0-1 coherence at exactly the rate 0.5 * Z did (a
+    dissipator only sees *differences* of a diagonal jump operator, and both have
+    c_0 - c_1 = 1), and a leakage level dephases at the usual level-squared rate.
+    """
+    return np.diag(np.arange(d, dtype=float))
+
+
+def _lower(d: int) -> np.ndarray:
+    """Bosonic lowering operator sum_k sqrt(k) |k-1><k|."""
+    return np.diag(np.sqrt(np.arange(1, d)), 1)
+
+
+def construct_decay_basis(levels: tuple[int, int] = QUBIT_LEVELS) -> np.ndarray:
+    """The four dissipator superoperators scaled by (d1, d2, r1, r2)."""
+    la, lb = levels
+    eye_a, eye_b = np.eye(la), np.eye(lb)
+    return np.array(
+        [
+            _dissipator_super(np.kron(_number(la), eye_b)),  # scaled by d1
+            _dissipator_super(np.kron(eye_a, _number(lb))),  # scaled by d2
+            _dissipator_super(2.0 * np.kron(_lower(la), eye_b)),  # scaled by r1
+            _dissipator_super(2.0 * np.kron(eye_a, _lower(lb))),  # scaled by r2
+        ],
+        dtype=complex,
+    )
+
+
+def construct_cz(levels: tuple[int, int] = QUBIT_LEVELS) -> np.ndarray:
+    """CZ on the computational block, identity on every leakage level.
+
+    The conditional phase the *ideal* gate applies is the one on |11>; whatever phase
+    the real pulse leaves on |02> belongs in the coherent-error Hamiltonian.
+    """
+    la, lb = levels
+    diag = np.ones(la * lb)
+    diag[lb + 1] = -1.0  # |11>
+    # diag[lb - 1] = -1.0  # |02>
+    return np.diag(diag)
+
+
+def construct_readout_rotation(levels: tuple[int, int] = QUBIT_LEVELS) -> np.ndarray:
+    """Basis-change for an X-basis readout, one Hadamard per subsystem.
+
+    The pre-measurement pulse only drives the computational transition, so it acts as
+    the identity on a leakage level.
+    """
+    mats = []
+    for d in levels:
+        m = np.eye(d)
+        m[:2, :2] = H
+        mats.append(m)
+    return np.kron(mats[0], mats[1])
+
+
+def _readout_bin(level: int) -> int:
+    """The computational outcome a raw level is reported as."""
+    return level if level < 2 else LEAK_READOUT_LEVEL
 
 
 # The generator is *linear* in (eta, eps, kap, d1**2, d2**2, r1**2, r2**2): each Hamiltonian
@@ -102,28 +188,52 @@ def construct_unit_operator(
     return (generator_basis.reshape(7, -1).T @ coefficients).reshape(16, 16)
 
 
-def construct_ideal_msmt_ops(rot: np.ndarray = None) -> np.ndarray:
-    """The four ideal projectors, rotated into the measured basis by `rot`.
+def construct_ideal_msmt_ops(
+    rot: np.ndarray = None, levels: tuple[int, int] = QUBIT_LEVELS
+) -> np.ndarray:
+    """The four ideal outcome operators, rotated into the measured basis by `rot`.
 
-    `rot = kron(H, H)` gives the X basis (the default), `rot = None` the Z basis.
+    `rot = construct_readout_rotation(levels)` gives the X basis, `rot = None` (the
+    default) the Z basis.
+
+    A leakage level is counted in the outcome named by LEAK_READOUT_LEVEL.
     """
-    ops = np.zeros((4, 4, 4), dtype=complex)
-    for i in range(4):
-        ops[i, i, i] = 1.0
-        if rot is not None:
-            ops[i] = rot.conj().T @ ops[i] @ rot
+    la, lb = levels
+    dim = la * lb
+    ops = np.zeros((4, dim, dim), dtype=complex)
+    for a in range(la):
+        for b in range(lb):
+            idx = a * lb + b
+            ops[2 * _readout_bin(a) + _readout_bin(b), idx, idx] = 1.0
+    if rot is not None:
+        ops = rot.conj().T @ ops @ rot
     return ops.reshape(4, -1)
 
 
-def construct_init_state():
-    return construct_ideal_msmt_ops()[0]
+def construct_init_state(
+    rot: np.ndarray = None, levels: tuple[int, int] = QUBIT_LEVELS
+):
+    """vec of the prepared state |00>, rotated by `rot`."""
+    dim = levels[0] * levels[1]
+    op = np.zeros((dim, dim), dtype=complex)
+    op[0, 0] = 1.0
+    if rot is not None:
+        op = rot.conj().T @ op @ rot
+    return op.reshape(-1)
 
 
-def construct_msmt_op(ep1, em1, ep2, em2):
+def construct_msmt_op(
+    ep1, em1, ep2, em2, rot: np.ndarray = None, levels: tuple[int, int] = QUBIT_LEVELS
+):
+    """Outcome operators with the 4x4 readout confusion matrix folded in.
+
+    The confusion matrix stays 4x4 because it acts on the reported outcomes, which
+    `construct_ideal_msmt_ops` has already binned down to four.
+    """
     a = np.array([[1 - ep1, em1], [ep1, 1 - em1]])
     b = np.array([[1 - ep2, em2], [ep2, 1 - em2]])
     confusion = (a[:, None, :, None] * b[None, :, None, :]).reshape(4, 4)
-    return confusion @ construct_ideal_msmt_ops()
+    return confusion @ construct_ideal_msmt_ops(rot, levels)
 
 
 def get_fidelities(

@@ -12,7 +12,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 from scipy.linalg import expm
 from scipy.optimize import least_squares
 
-from get_error_bars import canonicalize_signs
+from get_error_bars import PHASE_NAMES, canonicalize_signs
 from least_squares import (
     _GENERATOR_BASIS,
     PARAM_NAMES,
@@ -22,10 +22,13 @@ from least_squares import (
     H,
     _hamiltonian_super,
     _on,
+    construct_cz,
+    construct_decay_basis,
     construct_full_params,
     construct_generator_basis,
     construct_init_state,
     construct_msmt_op,
+    construct_readout_rotation,
     get_fidelities,
     residuals,
 )
@@ -140,10 +143,11 @@ def process_ds_raw(ds: xr.Dataset) -> xr.Dataset:
 ############
 # Analysis functions
 ############
-# eta, eps, kap | d1, d2 | r1, r2 | ep1, em1, ep2, em2
-# Params: Coherent errors, sigma_z decay rate, sigma_- decay rate, readout + prep error rates
-LOWER_BOUNDS = np.array([-np.pi] * 3 + [0.0] * 4 + [0.0] * 4)
-UPPER_BOUNDS = np.array([np.pi] * 3 + [1.0] * 4 + [0.3] * 4)
+# eta, eps, kap | d1, d2 | r1, r2 | ep1, em1, ep2, em2 | phi
+# Params: Coherent errors, sigma_z decay rate, sigma_- decay rate, readout + prep error
+# rates, leakage coupling.
+LOWER_BOUNDS = np.array([-np.pi] * 3 + [0.0] * 4 + [0.0] * 4 + [-0.3])
+UPPER_BOUNDS = np.array([np.pi] * 3 + [1.0] * 4 + [0.3] * 4 + [0.3])
 
 N_RESTARTS = 20
 GLS_PASSES = 2
@@ -233,17 +237,16 @@ def _decay_init(gate_time: float, t2: list, t1: list) -> list:
     """Initial (d1, d2, r1, r2) values.
 
     `new_gate_fidelities` integrates the dissipator over the real gate durations in ns,
-    so its d and r are absolute rates, instead of per-repetition fractions. The jump operator
-    d/2 Z damps coherences at d * 1e-3 / 2, and 2 r sigma^- damps populations at
-    4 r * 1e-3. Inverting those gives d = 2000 / T_phi and r = 250 / T1, where
+    so its d and r are absolute rates, instead of per-repetition fractions.
+    d = 1000 / T_phi and r = 1000 / T1, where
     1 / T_phi = 1 / T2 - 1 / (2 T1).
     """
     if method == "model_dd":
         return [
-            2000 * (1 / t2[0] - 1 / (2 * t1[0])),
-            2000 * (1 / t2[1] - 1 / (2 * t1[1])),
-            250 / t1[0],
-            250 / t1[1],
+            1000 * (1 / t2[0] - 1 / (2 * t1[0])),
+            1000 * (1 / t2[1] - 1 / (2 * t1[1])),
+            1000 / t1[0],
+            1000 / t1[1],
         ]
     return [
         gate_time / t2[0],
@@ -267,7 +270,7 @@ def construct_init_values(
     Returns:
         np.ndarray: Array of initial parameter values (with fixed-value entries removed).
     """
-    # eta, eps, kap | d1, d2, r1, r2 | ep1, em1, ep2, em2
+    # eta, eps, kap | d1, d2, r1, r2 | ep1, em1, ep2, em2 | phi
     t2, t1 = [11000, 21000], [10000, 30000]
     discard_idx = [i for i, name in enumerate(PARAM_NAMES) if name in fixed_params]
     if "set1" in family.label:
@@ -307,7 +310,13 @@ def construct_init_values(
                 _decay_init(gate_time, t2, t1),
             ]
         )
-    params = np.concatenate([params, rng.uniform(0, 0.1, size=4)])
+    params = np.concatenate(
+        [
+            params,
+            rng.uniform(0, 0.1, size=4),
+            rng.uniform(-PHI_INIT_SCALE, PHI_INIT_SCALE, size=1),
+        ]
+    )
     if discard_idx:
         params = np.delete(params, discard_idx)
     return params
@@ -371,12 +380,29 @@ def evolve(L: np.ndarray, t: float):
     return np.linalg.solve(eigenvectors.T, scaled.T).T
 
 
+# Levels kept on (control, target)
+LEVELS = (2, 3)
+DIM = np.prod(LEVELS)
+
+CZ = construct_cz(LEVELS)
 # vec form of rho -> CZ rho CZ^dag, i.e. kron(CZ, CZ.conj()).
-CZ_SUPER = np.kron(np.diag([1.0, 1.0, 1.0, -1.0]), np.diag([1.0, 1.0, 1.0, -1.0]))
+CZ_SUPER = np.kron(CZ, CZ.conj())
+# X-basis readout;
+READOUT_ROT = construct_readout_rotation(LEVELS)
+# Dissipators scaled by (d1, d2, r1, r2), in the units `_decay_init` produces.
+DECAY_BASIS = construct_decay_basis(LEVELS)
 SQ_GT, TQ_GT = 30, 60
 
+# Number operators of the two subsystems, in units of the computational splitting
+# E2's third entry carries the anharmonicity: |2> sits at 2 - 0.05.
+E1 = np.array([[0.0, 0.0], [0.0, 1.0]], dtype=complex)
+E2 = np.array([[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 2.0 - 0.05]], dtype=complex)
+INT = np.zeros((DIM, DIM), dtype=complex)
+INT[4, 2] = INT[2, 4] = 1.0
 
-# da319f58-1f7c-4a18-8501-f6d1c9695a4d
+PHI_INIT_SCALE = 0.02
+
+
 def new_gate_fidelities(
     n,
     eta,
@@ -390,6 +416,7 @@ def new_gate_fidelities(
     em1,
     ep2,
     em2,
+    phi,
     generator_basis: np.ndarray = _GENERATOR_BASIS,
 ):
     if isinstance(n, (int, np.integer)):
@@ -398,24 +425,25 @@ def new_gate_fidelities(
 
     # Set 0 "qubit_pairq3" (no DD experiment)
     dissipator = 1e-3 * (
-        d1 * SET1_BASIS[3]
-        + d2 * SET1_BASIS[4]
-        + r1 * SET1_BASIS[5]
-        + r2 * SET1_BASIS[6]
+        d1 * DECAY_BASIS[0]
+        + d2 * DECAY_BASIS[1]
+        + r1 * DECAY_BASIS[2]
+        + r2 * DECAY_BASIS[3]
     )
     cz = (
         evolve(dissipator, TQ_GT)
         @ evolve(
-            eta * _hamiltonian_super(np.kron(SIGMA_Z, SIGMA_Z))
-            + eps * _hamiltonian_super(np.kron(SIGMA_Z, np.eye(2)))
-            + kap * _hamiltonian_super(np.kron(np.eye(2), SIGMA_Z)),
+            eta * _hamiltonian_super(np.kron(E1, E2))
+            + eps * _hamiltonian_super(np.kron(E1, np.eye(3)))
+            + kap * _hamiltonian_super(np.kron(np.eye(2), E2))
+            + phi * _hamiltonian_super(INT),
             1,
         )
         @ CZ_SUPER
     )
     unit_op = cz @ cz
     unit_op = unit_op @ unit_op
-    rot = np.kron(H, H)
+    rot = READOUT_ROT
 
     # Set 1
     # dissipator = 1e-3 * (
@@ -472,8 +500,8 @@ def new_gate_fidelities(
     # unit_op = unit_op @ unit_op
     # rot = None
 
-    state = construct_init_state(rot).astype(complex)
-    msmt_ops = construct_msmt_op(ep1, em1, ep2, em2, rot=rot)
+    state = construct_init_state(rot, LEVELS).astype(complex)
+    msmt_ops = construct_msmt_op(ep1, em1, ep2, em2, rot=rot, levels=LEVELS)
 
     # `unit_op` is the propagator of one repetition, so n repetitions is the matrix
     # *power* unit_op**n = V diag(w**n) V^-1
@@ -594,15 +622,16 @@ def construct_x_trial(
     Returns:
         np.ndarray: A parameter vector suitable for passing to the solver.
     """
-    # eta, eps, kap | d1, d2, r1, r2 | ep1, em1, ep2, em2
+    # eta, eps, kap | d1, d2, r1, r2 | ep1, em1, ep2, em2 | phi
     discard_idx = [i for i, name in enumerate(PARAM_NAMES) if name in fixed_params]
     if x0 is None:
         if method == "model_dd":
             x0_trial = np.concatenate(
                 [
-                    rng.uniform(0.0, 0.02, size=3),
+                    rng.uniform(-0.02, 0.02, size=3),
                     rng.uniform(0.0, 1 / 100, size=4),
                     rng.uniform(0.0, 0.2, size=4),
+                    rng.uniform(-PHI_INIT_SCALE, PHI_INIT_SCALE, size=1),
                 ]
             )
         else:
@@ -621,9 +650,10 @@ def construct_x_trial(
         if method == "model_dd":
             perturb = np.concatenate(
                 [
-                    rng.uniform(0, 0.01, size=3),
+                    rng.uniform(-0.01, 0.01, size=3),
                     rng.uniform(0, 0.01, size=4),
                     rng.uniform(0, 0.001, size=4),
+                    rng.uniform(-PHI_INIT_SCALE, PHI_INIT_SCALE, size=1),
                 ]
             )
         else:
@@ -744,15 +774,30 @@ def generator_basis_for(label: str) -> np.ndarray:
 
 
 def fixed_params_for(label: str) -> dict:
-    # if "set1" in label:
-    #     return {"r1": 0.0, "r2": 0.0}
+    if label == "qubit_pairq3-6":
+        return {"phi": 0.0}
     return {}
 
 
 def bounds_for(label: str) -> tuple[np.ndarray, np.ndarray]:
-    # if "set1" in label:
-    #     keep_idx = [i for i, name in enumerate(PARAM_NAMES) if name not in ["r1", "r2"]]
-    #     return LOWER_BOUNDS[keep_idx], UPPER_BOUNDS[keep_idx]
+    if label == "qubit_pairq3-6":
+        fixed = fixed_params_for(label)
+        keep_idx = [i for i, name in enumerate(PARAM_NAMES) if name not in fixed]
+        lower_bounds = LOWER_BOUNDS[keep_idx]
+        upper_bounds = UPPER_BOUNDS[keep_idx]
+
+        # free_names = [name for name in PARAM_NAMES if name not in fixed]
+        # decay_floors = {"d1": 0.16, "d2": 0.16, "r1": 0.08, "r2": 0.08}
+        # for name, floor in decay_floors.items():
+        #     if name in free_names:
+        #         lower_bounds[free_names.index(name)] = floor
+
+        # decay_caps = {"d1": 1 / 6, "d2": 1 / 6, "r1": 1 / 6, "r2": 1 / 6}
+        # for name, cap in decay_caps.items():
+        #     if name in free_names:
+        #         upper_bounds[free_names.index(name)] = cap
+        assert np.all(lower_bounds < upper_bounds)
+        return lower_bounds, upper_bounds
     return LOWER_BOUNDS, UPPER_BOUNDS
 
 
@@ -818,6 +863,7 @@ def plot_family(
     pdf: PdfPages,
     generator_basis: np.ndarray = _GENERATOR_BASIS,
     fixed_params: dict | None = None,
+    model: np.ndarray | None = None,
 ) -> None:
     """Measured probabilities against the fitted model, one panel per joint state.
 
@@ -825,7 +871,8 @@ def plot_family(
     """
     dense_n = np.linspace(float(np.min(family.n)), float(np.max(family.n)), PLOT_POINTS)
     x = construct_full_params(params, fixed_params)
-    model = fidelity_fn(dense_n, *x, generator_basis=generator_basis).real
+    if model is None:
+        model = fidelity_fn(dense_n, *x, generator_basis=generator_basis).real
     fig, axes = plt.subplots(1, 4, figsize=(16, 3.4), sharex=True, sharey=True)
     for idx, (ax, ss) in enumerate(zip(axes, JOINT_STATES)):
         errs = family.errs[:, idx]
@@ -839,7 +886,17 @@ def plot_family(
             capsize=2,
             label="data",
         )
-        ax.plot(dense_n, model[:, idx], "-", lw=1.5, color="crimson", label="fit")
+        ax.plot(
+            dense_n,
+            model[:, idx],
+            linestyle="-",
+            marker=None,
+            ms=2,
+            lw=1.5,
+            color="crimson",
+            label="fit",
+        )
+
         ax.set_title(f"P_{ss}")
         ax.set_xlabel("number_of_operations")
     axes[0].set_ylabel("probability")

@@ -38,12 +38,13 @@ def construct_noisy_data(data, sigma=None, rng=None):
     return noisy_data
 
 
-PHASE_NAMES = ["eta", "eps", "kap"]
+# Every coefficient of a term in the coherent-error Hamiltonian.
+PHASE_NAMES = ["eta", "eps", "kap", "phi"]
 
 
 def canonicalize_signs(params):
-    """Pick the eps >= 0 branch of the (eta, eps, kap) -> -(eta, eps, kap) degeneracy."""
-    if params["eps"] < 0:
+    """Pick the eps >= 0 branch of the phases -> -phases degeneracy."""
+    if params.get("eps", 0.0) < 0:
         return {
             name: -value if name in PHASE_NAMES else value
             for name, value in params.items()
