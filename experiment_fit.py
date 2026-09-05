@@ -12,9 +12,10 @@ from matplotlib.backends.backend_pdf import PdfPages
 from scipy.linalg import expm
 from scipy.optimize import least_squares
 
-from get_error_bars import PHASE_NAMES, canonicalize_signs
+from get_error_bars import PHASE_NAMES
 from least_squares import (
     _GENERATOR_BASIS,
+    MIN_WEIGHT_PROB,
     PARAM_NAMES,
     SIGMA_X,
     SIGMA_Y,
@@ -25,7 +26,6 @@ from least_squares import (
     construct_cz,
     construct_decay_basis,
     construct_full_params,
-    construct_generator_basis,
     construct_init_state,
     construct_msmt_op,
     construct_readout_rotation,
@@ -233,26 +233,18 @@ def iter_families(ds: xr.Dataset) -> list[Family]:
     return families
 
 
-def _decay_init(gate_time: float, t2: list, t1: list) -> list:
-    """Initial (d1, d2, r1, r2) values.
+def _decay_init(t2: list, t1: list) -> list:
+    """Initial (d1, d2, r1, r2) values, in 1/us.
 
-    `new_gate_fidelities` integrates the dissipator over the real gate durations in ns,
-    so its d and r are absolute rates, instead of per-repetition fractions.
-    d = 1000 / T_phi and r = 1000 / T1, where
-    1 / T_phi = 1 / T2 - 1 / (2 T1).
+    Both methods integrate the dissipator over the real gate durations in ns, so d
+    and r are absolute rates rather than per-repetition fractions:
+    d = 1000 / T_phi and r = 1000 / T1, where 1 / T_phi = 1 / T2 - 1 / (2 T1).
     """
-    if method == "model_dd":
-        return [
-            1000 * (1 / t2[0] - 1 / (2 * t1[0])),
-            1000 * (1 / t2[1] - 1 / (2 * t1[1])),
-            1000 / t1[0],
-            1000 / t1[1],
-        ]
     return [
-        gate_time / t2[0],
-        gate_time / t2[1],
-        gate_time / t1[0],
-        gate_time / t1[1],
+        1000 * (1 / t2[0] - 1 / (2 * t1[0])),
+        1000 * (1 / t2[1] - 1 / (2 * t1[1])),
+        1000 / t1[0],
+        1000 / t1[1],
     ]
 
 
@@ -275,39 +267,35 @@ def construct_init_values(
     discard_idx = [i for i, name in enumerate(PARAM_NAMES) if name in fixed_params]
     if "set1" in family.label:
         zi, iz = (0.9725 - 1) * 2 * np.pi, 0.2330 * 2 * np.pi
-        gate_time = 60 + 3 * 32
         params = np.concatenate(
             [
                 rng.uniform(0, 0.01, size=1),
                 rng.uniform(0, 0.1, size=2),
                 # zi,
                 # iz,
-                _decay_init(gate_time, t2, t1),
+                _decay_init(t2, t1),
             ]
         )
 
-    elif ("set2" in family.label) or ("set3" in family.label):
-        gate_time = 60 + 32
+    elif (
+        ("set2" in family.label)
+        or ("set3" in family.label)
+        or ("set4" in family.label)
+        or ("set5" in family.label)
+        or (family.label == "qubit_pairq3-6")
+    ):
         params = np.concatenate(
             [
                 rng.uniform(0, 0.01, size=3),
-                _decay_init(gate_time, t2, t1),
+                _decay_init(t2, t1),
             ]
         )
-    elif ("set4" in family.label) or ("set5" in family.label):
-        gate_time = 60 + 3 * 32
+    elif "ibm" in family.label:
+        t2, t1 = [100000, 100000], [100000, 100000]
         params = np.concatenate(
             [
-                rng.uniform(0, 0.01, size=3),
-                _decay_init(gate_time, t2, t1),
-            ]
-        )
-    elif family.label == "qubit_pairq3-6":
-        gate_time = 60
-        params = np.concatenate(
-            [
-                rng.uniform(0, 0.01, size=3),
-                _decay_init(gate_time, t2, t1),
+                rng.uniform(0, 0.02, size=3),
+                _decay_init(t2, t1),
             ]
         )
     params = np.concatenate(
@@ -320,6 +308,13 @@ def construct_init_values(
     if discard_idx:
         params = np.delete(params, discard_idx)
     return params
+
+
+def get_decay_timescale(d1, d2, r1, r2, label: str) -> np.ndarray:
+    """(T1, T2) in ns from the fitted rates, which are in 1/us for both methods."""
+    t1 = 1 / np.array([r1, r2])
+    t2 = 1 / np.array([r1 / 2 + d1, r2 / 2 + d2])
+    return 1e3 * t1, 1e3 * t2
 
 
 # cond(V) past which an `eig` basis is too ill-conditioned to exponentiate through,
@@ -381,7 +376,7 @@ def evolve(L: np.ndarray, t: float):
 
 
 # Levels kept on (control, target)
-LEVELS = (2, 3)
+LEVELS = (2, 2)
 DIM = np.prod(LEVELS)
 
 CZ = construct_cz(LEVELS)
@@ -397,10 +392,241 @@ SQ_GT, TQ_GT = 30, 60
 # E2's third entry carries the anharmonicity: |2> sits at 2 - 0.05.
 E1 = np.array([[0.0, 0.0], [0.0, 1.0]], dtype=complex)
 E2 = np.array([[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 2.0 - 0.05]], dtype=complex)
-INT = np.zeros((DIM, DIM), dtype=complex)
-INT[4, 2] = INT[2, 4] = 1.0
+# INT = np.zeros((DIM, DIM), dtype=complex)
+# INT[4, 2] = INT[2, 4] = 1.0
 
 PHI_INIT_SCALE = 0.02
+
+
+# DD pulses, as 4x4 unitaries. `_super` turns one into the superoperator
+# rho -> U rho U^dag, i.e. kron(U, U.conj()); building them that way (rather than
+# kron(U, U) by hand) keeps the conjugate on the imaginary Pauli-Y pulses, whose
+# sign would otherwise only cancel by accident because each appears an even number
+# of times per half-repetition.
+def _super(u: np.ndarray) -> np.ndarray:
+    """Superoperator of rho -> u rho u^dag."""
+    return np.kron(u, u.conj())
+
+
+_XI = np.kron(SIGMA_X, np.eye(2))
+_IX = np.kron(np.eye(2), SIGMA_X)
+_YI = np.kron(SIGMA_Y, np.eye(2))
+_IY = np.kron(np.eye(2), SIGMA_Y)
+_XY = _XI @ _IY
+_YX = _YI @ _IX
+_HH = np.kron(H, H)
+_IH = np.kron(np.eye(2), H)
+_HI = np.kron(H, np.eye(2))
+_II = np.eye(DIM)
+
+XI, IX, YI, IY = _super(_XI), _super(_IX), _super(_YI), _super(_IY)
+XY, YX = _super(_XY), _super(_YX)
+HH, IH, HI = _super(_HH), _super(_IH), _super(_HI)
+
+
+_ZZ_ERR = (
+    np.kron(SIGMA_Z, SIGMA_Z),
+    _on(SIGMA_Z, 0),
+    _on(SIGMA_Z, 1),
+)
+_YY_ERR = (
+    np.kron(SIGMA_Y, SIGMA_Y),
+    _on(SIGMA_Y, 0),
+    _on(SIGMA_Y, 1),
+)
+_XX_ERR = (
+    np.kron(SIGMA_X, SIGMA_X),
+    _on(SIGMA_X, 0),
+    _on(SIGMA_X, 1),
+)
+_SET4_ERR = (
+    np.kron(SIGMA_Z, SIGMA_X),
+    np.kron(SIGMA_X, SIGMA_Y),
+    np.kron(SIGMA_Y, SIGMA_Z),
+)
+_SET5_ERR = (
+    np.kron(SIGMA_X, SIGMA_Z),
+    np.kron(SIGMA_Y, SIGMA_X),
+    np.kron(SIGMA_Z, SIGMA_Y),
+)
+
+
+class Sequence(NamedTuple):
+    """One half-repetition of a DD sequence plus the basis it is read out in."""
+
+    blocks: tuple  # (pulse 4x4, err_ops or None, dwell_ns)
+    rot: np.ndarray | None  # pre-measurement rotation, None for the Z basis
+
+
+def _cz_block(err_ops, ideal=_II):
+    return (ideal, err_ops, TQ_GT)
+
+
+def _pulse_block(u):
+    return (u, None, SQ_GT)
+
+
+############
+# The five DD sequences
+############
+# Each experiment set is one half repetition of a DD sequence, written here as the
+# blocks it plays in time order (first played first):
+#
+#   pulse     -- the ideal gate of the block, as a 4x4 unitary.
+#   err_ops   -- the (eta, eps, kap) Pauli triple the block's coherent error is
+#                written in, or None for a single-qubit pulse (taken to be error free).
+#   dwell_ns  -- how long the block occupies the qubits, and so how long the
+#                dissipator acts for.
+#   set1 -> ZZ, ZI, IZ      set2 -> YY, YI, IY      set3 -> XX, XI, IX
+#   set4 -> ZX, XY, YZ      set5 -> XZ, YX, ZY
+SEQUENCES = {
+    # H CZ H  X  H CZ H  X, with the ideal CZ kept (it commutes with the error).
+    "set1": Sequence(
+        (
+            _pulse_block(_HH),
+            _cz_block(_ZZ_ERR, ideal=CZ),
+            _pulse_block(_HH),
+            _pulse_block(_XI),
+            _pulse_block(_HH),
+            _cz_block(_ZZ_ERR, ideal=CZ),
+            _pulse_block(_HH),
+            _pulse_block(_IX),
+        ),
+        None,
+    ),
+    "set2": Sequence(
+        (
+            _cz_block(_YY_ERR),
+            _pulse_block(_YI),
+            _cz_block(_YY_ERR),
+            _pulse_block(_IY),
+        ),
+        None,
+    ),
+    "set3": Sequence(
+        (
+            _cz_block(_XX_ERR),
+            _pulse_block(_XI),
+            _cz_block(_XX_ERR),
+            _pulse_block(_IX),
+        ),
+        None,
+    ),
+    "set4": Sequence(
+        (
+            _pulse_block(_IH),
+            _cz_block(_SET4_ERR),
+            _pulse_block(_IH),
+            _pulse_block(_YX),
+            _pulse_block(_IH),
+            _cz_block(_SET4_ERR),
+            _pulse_block(_IH),
+            _pulse_block(_XY),
+        ),
+        construct_readout_rotation(LEVELS),
+    ),
+    "set5": Sequence(
+        (
+            _pulse_block(_HI),
+            _cz_block(_SET5_ERR),
+            _pulse_block(_HI),
+            _pulse_block(_YX),
+            _pulse_block(_HI),
+            _cz_block(_SET5_ERR),
+            _pulse_block(_HI),
+            _pulse_block(_XY),
+        ),
+        construct_readout_rotation(LEVELS),
+    ),
+}
+
+
+def sequence_for(label: str) -> Sequence:
+    """The DD sequence the family `label` was taken with."""
+    for key, sequence in SEQUENCES.items():
+        if key in label:
+            return sequence
+    # The plain (no-DD) node and the IBM CSVs both run set1's ZZ/ZI/IZ experiment.
+    if label == "qubit_pairq3-6" or "ibm" in label:
+        return SEQUENCES["set1"]
+    raise RuntimeError(f"Unrecognized family label: {label}")
+
+
+def _decay_super(d1, d2, r1, r2) -> np.ndarray:
+    """The dissipator at rates (d1, d2, r1, r2), which are given in 1/us."""
+    return 1e-3 * (
+        d1 * DECAY_BASIS[0]
+        + d2 * DECAY_BASIS[1]
+        + r1 * DECAY_BASIS[2]
+        + r2 * DECAY_BASIS[3]
+    )
+
+
+def construct_unit_op(label: str, eta, eps, kap, d1, d2, r1, r2) -> np.ndarray:
+    """Superoperator of one full repetition of `label`'s sequence."""
+    dissipator = _decay_super(d1, d2, r1, r2)
+    half = np.eye(DIM**2, dtype=complex)
+    for pulse, err_ops, dwell in sequence_for(label).blocks:
+        block = _super(pulse)
+        if err_ops is not None:
+            coherent = (
+                eta * _hamiltonian_super(err_ops[0])
+                + eps * _hamiltonian_super(err_ops[1])
+                + kap * _hamiltonian_super(err_ops[2])
+            )
+            block = evolve(coherent, 1) @ block
+        half = (evolve(dissipator, dwell) @ block) @ half
+    return half @ half
+
+
+@lru_cache(maxsize=None)
+def effective_generator_basis(label: str) -> np.ndarray:
+    """`label`'s sequence collapsed to the single generator the "mix" path uses.
+
+    The "mix" model has no DD pulses: it exponentiates one 16x16 generator for
+    `4 * n`, four gates per repetition. We want the generator in the "mix" path
+    to be an approximation of `construct_unit_op`, the simplest of which is the
+    first-order Magnus (toggling-frame) average.
+    Each block's contribution is conjugated by the pulses played before it,
+    weighted by how long the block lasts:
+
+        G_eff = (1 / 4) sum_j W_j^dag (L_err_j + dwell_j L_diss) W_j,
+
+    where W_j is the cumulative pulse superoperator through block j. For the coherent
+    part it just reproduces the surviving Pauli triple in the frame the pulses leave
+    it in.
+    The dissipative part needs to be derived. For instance, relaxation operators
+    will be symmetrized to some extent due to this approach.
+    """
+    # The whole repetition, not one half doubled: the pulses of the first half do
+    # not compose back to the identity, so the second half runs in a frame the first
+    # half left rotated. For set2 that is the difference between relaxation coming
+    # out 1/3 sigma^- and 2/3 sigma^+ and its true even split.
+    blocks = sequence_for(label).blocks * 2
+    basis = np.zeros((7, DIM**2, DIM**2), dtype=complex)
+    frame = np.eye(DIM**2, dtype=complex)
+    for pulse, err_ops, dwell in blocks:
+        frame = _super(pulse) @ frame
+        if err_ops is not None:
+            for k, op in enumerate(err_ops):
+                basis[k] += frame.conj().T @ _hamiltonian_super(op) @ frame
+        for k in range(4):
+            basis[3 + k] += 1e-3 * dwell * (frame.conj().T @ DECAY_BASIS[k] @ frame)
+    # `get_fidelities` exponentiates for 4 * n, four gates per repetition.
+    basis /= 4
+    # Every caller shares the cached array.
+    basis.flags.writeable = False
+    return basis
+
+
+def generator_basis_for(label: str) -> np.ndarray:
+    """The Hamiltonian basis each db_set drives, as a generator basis."""
+    return effective_generator_basis(label)
+
+
+def readout_basis_for(label: str) -> np.ndarray | None:
+    """The pre-measurement rotation each db_set reads out in."""
+    return sequence_for(label).rot
 
 
 def new_gate_fidelities(
@@ -418,87 +644,21 @@ def new_gate_fidelities(
     em2,
     phi,
     generator_basis: np.ndarray = _GENERATOR_BASIS,
+    readout_basis: np.ndarray = None,
+    label: str | None = None,
 ):
+    """Outcome probabilities from the DD sequence `label` was taken with.
+
+    Builds the propagator of one repetition gate by gate out of `SEQUENCES`.
+    `generator_basis` and `readout_basis` are ignored and are accepted
+    only so this shares a signature with `get_fidelities`.
+    """
     if isinstance(n, (int, np.integer)):
         n = np.arange(n)
     n = np.asarray(n, dtype=float)
 
-    # Set 0 "qubit_pairq3" (no DD experiment)
-    dissipator = 1e-3 * (
-        d1 * DECAY_BASIS[0]
-        + d2 * DECAY_BASIS[1]
-        + r1 * DECAY_BASIS[2]
-        + r2 * DECAY_BASIS[3]
-    )
-    cz = (
-        evolve(dissipator, TQ_GT)
-        @ evolve(
-            eta * _hamiltonian_super(np.kron(E1, E2))
-            + eps * _hamiltonian_super(np.kron(E1, np.eye(3)))
-            + kap * _hamiltonian_super(np.kron(np.eye(2), E2))
-            + phi * _hamiltonian_super(INT),
-            1,
-        )
-        @ CZ_SUPER
-    )
-    unit_op = cz @ cz
-    unit_op = unit_op @ unit_op
-    rot = READOUT_ROT
-
-    # Set 1
-    # dissipator = 1e-3 * (
-    #     d1 * SET1_BASIS[3]
-    #     + d2 * SET1_BASIS[4]
-    #     + r1 * SET1_BASIS[5]
-    #     + r2 * SET1_BASIS[6]
-    # )
-    # cz = (
-    #     evolve(dissipator, TQ_GT)
-    #     @ evolve(
-    #         eta * _hamiltonian_super(np.kron(SIGMA_Z, SIGMA_Z))
-    #         + eps * _hamiltonian_super(np.kron(SIGMA_Z, np.eye(2)))
-    #         + kap * _hamiltonian_super(np.kron(np.eye(2), SIGMA_Z)),
-    #         1,
-    #     )
-    #     # @ CZ_SUPER
-    # )
-    # xi = evolve(dissipator, SQ_GT) @ np.kron(
-    #     np.kron(SIGMA_X, np.eye(2)), np.kron(SIGMA_X, np.eye(2))
-    # )
-    # ix = evolve(dissipator, SQ_GT) @ np.kron(
-    #     np.kron(np.eye(2), SIGMA_X), np.kron(np.eye(2), SIGMA_X)
-    # )
-    # hh = evolve(dissipator, SQ_GT) @ np.kron(np.kron(H, H), np.kron(H, H))
-    # unit_op = ix @ (hh @ cz @ hh) @ xi @ (hh @ cz @ hh)
-    # unit_op = unit_op @ unit_op
-    # rot = None
-
-    # Set 2
-    # dissipator = 1e-3 * (
-    #     d1 * SET1_BASIS[3]
-    #     + d2 * SET1_BASIS[4]
-    #     + r1 * SET1_BASIS[5]
-    #     + r2 * SET1_BASIS[6]
-    # )
-    # cz = (
-    #     evolve(dissipator, TQ_GT)
-    #     @ evolve(
-    #         eta * _hamiltonian_super(np.kron(SIGMA_Y, SIGMA_Y))
-    #         + eps * _hamiltonian_super(np.kron(SIGMA_Y, np.eye(2)))
-    #         + kap * _hamiltonian_super(np.kron(np.eye(2), SIGMA_Y)),
-    #         1,
-    #     )
-    #     # @ CZ_SUPER
-    # )
-    # yi = evolve(dissipator, SQ_GT) @ np.kron(
-    #     np.kron(SIGMA_Y, np.eye(2)), np.kron(SIGMA_Y, np.eye(2))
-    # )
-    # iy = evolve(dissipator, SQ_GT) @ np.kron(
-    #     np.kron(np.eye(2), SIGMA_Y), np.kron(np.eye(2), SIGMA_Y)
-    # )
-    # unit_op = iy @ cz @ yi @ cz
-    # unit_op = unit_op @ unit_op
-    # rot = None
+    unit_op = construct_unit_op(label, eta, eps, kap, d1, d2, r1, r2)
+    rot = readout_basis_for(label)
 
     state = construct_init_state(rot, LEVELS).astype(complex)
     msmt_ops = construct_msmt_op(ep1, em1, ep2, em2, rot=rot, levels=LEVELS)
@@ -517,21 +677,33 @@ def gate_residuals(
     shots: int,
     weight_probs: np.ndarray | None = None,
     generator_basis: np.ndarray = _GENERATOR_BASIS,
+    readout_basis: np.ndarray = None,
     fixed_params: dict | None = None,
+    label: str | None = None,
 ) -> np.ndarray:
     x_full = construct_full_params(x, fixed_params)
-    model_data = new_gate_fidelities(n, *x_full, generator_basis=generator_basis).real
+    model_data = new_gate_fidelities(
+        n,
+        *x_full,
+        generator_basis=generator_basis,
+        readout_basis=readout_basis,
+        label=label,
+    ).real
 
     probs = model_data if weight_probs is None else weight_probs
     diffs = model_data - data
-    return (np.sqrt(shots) * diffs / np.sqrt(np.clip(probs, 1e-6, None))).reshape(-1)
+    # Same floor as `least_squares.residuals`, so the two methods' reduced_chi2 are
+    # on the same scale and can be compared.
+    return (
+        np.sqrt(shots) * diffs / np.sqrt(np.clip(probs, MIN_WEIGHT_PROB, None))
+    ).reshape(-1)
 
 
-method = "model_dd"
-if method == "model_dd":
+METHOD = "model_dd"
+if METHOD == "model_dd":
     residual_fn = gate_residuals  # residuals
     fidelity_fn = new_gate_fidelities  # get_fidelities
-elif method == "mix":
+elif METHOD == "mix":
     residual_fn = residuals
     fidelity_fn = get_fidelities
 
@@ -543,14 +715,25 @@ def _run_least_squares(
     shots: int,
     weight_probs: np.ndarray | None = None,
     generator_basis: np.ndarray = _GENERATOR_BASIS,
+    readout_basis: np.ndarray = None,
     fixed_params: dict | None = None,
     lower_bounds: np.ndarray = LOWER_BOUNDS,
     upper_bounds: np.ndarray = UPPER_BOUNDS,
+    label: str | None = None,
 ):
     return least_squares(
         residual_fn,
         x0,
-        args=(n, data, shots, weight_probs, generator_basis, fixed_params),
+        args=(
+            n,
+            data,
+            shots,
+            weight_probs,
+            generator_basis,
+            readout_basis,
+            fixed_params,
+            label,
+        ),
         bounds=(lower_bounds, upper_bounds),
         xtol=1e-8,
         ftol=1e-8,
@@ -564,9 +747,11 @@ def _gls_refine(
     data: np.ndarray,
     shots: int,
     generator_basis: np.ndarray = _GENERATOR_BASIS,
+    readout_basis: np.ndarray | None = None,
     fixed_params: dict | None = None,
     lower_bounds: np.ndarray = LOWER_BOUNDS,
     upper_bounds: np.ndarray = UPPER_BOUNDS,
+    label: str | None = None,
 ):
     """Iterated GLS: refit with the weights frozen at the current model prediction.
 
@@ -575,7 +760,13 @@ def _gls_refine(
     """
     for _ in range(GLS_PASSES):
         x = construct_full_params(result.x, fixed_params)
-        weight_probs = fidelity_fn(n, *x, generator_basis=generator_basis).real
+        weight_probs = fidelity_fn(
+            n,
+            *x,
+            generator_basis=generator_basis,
+            readout_basis=readout_basis,
+            label=label,
+        ).real
         refined = _run_least_squares(
             result.x,
             n,
@@ -583,9 +774,11 @@ def _gls_refine(
             shots,
             weight_probs,
             generator_basis=generator_basis,
+            readout_basis=readout_basis,
             fixed_params=fixed_params,
             lower_bounds=lower_bounds,
             upper_bounds=upper_bounds,
+            label=label,
         )
         shift = np.max(np.abs(refined.x - result.x))
         result = refined
@@ -624,46 +817,29 @@ def construct_x_trial(
     """
     # eta, eps, kap | d1, d2, r1, r2 | ep1, em1, ep2, em2 | phi
     discard_idx = [i for i, name in enumerate(PARAM_NAMES) if name in fixed_params]
+    # d and r are rates in 1/us in both methods, so one set of scales covers both.
     if x0 is None:
-        if method == "model_dd":
-            x0_trial = np.concatenate(
-                [
-                    rng.uniform(-0.02, 0.02, size=3),
-                    rng.uniform(0.0, 1 / 100, size=4),
-                    rng.uniform(0.0, 0.2, size=4),
-                    rng.uniform(-PHI_INIT_SCALE, PHI_INIT_SCALE, size=1),
-                ]
-            )
-        else:
-            x0_trial = np.concatenate(
-                [
-                    rng.uniform(0.0, 0.02, size=3),
-                    rng.uniform(0.0, 0.003, size=4),
-                    rng.uniform(0.0, 0.2, size=4),
-                ]
-            )
+        x0_trial = np.concatenate(
+            [
+                rng.uniform(-0.02, 0.02, size=3),
+                rng.uniform(0.0, 1 / 100, size=4),
+                rng.uniform(0.0, 0.2, size=4),
+                rng.uniform(-PHI_INIT_SCALE, PHI_INIT_SCALE, size=1),
+            ]
+        )
         if discard_idx:
             x0_trial = np.delete(x0_trial, discard_idx)
     elif attempt == 0:
         x0_trial = np.asarray(x0, dtype=float)
     else:
-        if method == "model_dd":
-            perturb = np.concatenate(
-                [
-                    rng.uniform(-0.01, 0.01, size=3),
-                    rng.uniform(0, 0.01, size=4),
-                    rng.uniform(0, 0.001, size=4),
-                    rng.uniform(-PHI_INIT_SCALE, PHI_INIT_SCALE, size=1),
-                ]
-            )
-        else:
-            perturb = np.concatenate(
-                [
-                    rng.uniform(0, 0.01, size=3),
-                    rng.uniform(0, 0.001, size=4),
-                    rng.uniform(0, 0.001, size=4),
-                ]
-            )
+        perturb = np.concatenate(
+            [
+                rng.uniform(-0.01, 0.01, size=3),
+                rng.uniform(0, 0.01, size=4),
+                rng.uniform(0, 0.001, size=4),
+                rng.uniform(-PHI_INIT_SCALE, PHI_INIT_SCALE, size=1),
+            ]
+        )
         if discard_idx:
             perturb = np.delete(perturb, discard_idx)
         x0_trial = np.asarray(x0, dtype=float) + perturb
@@ -678,9 +854,11 @@ def fit_family(
     x0: np.ndarray | None = None,
     n_restarts: int = N_RESTARTS,
     generator_basis: np.ndarray = _GENERATOR_BASIS,
+    readout_basis: np.ndarray | None = None,
     fixed_params: dict | None = None,
     lower_bounds: np.ndarray = LOWER_BOUNDS,
     upper_bounds: np.ndarray = UPPER_BOUNDS,
+    label: str | None = None,
 ) -> dict:
     """Multi-start least-squares fit of all four curves at once, on a fixed budget.
 
@@ -698,9 +876,11 @@ def fit_family(
             data,
             shots,
             generator_basis=generator_basis,
+            readout_basis=readout_basis,
             fixed_params=fixed_params,
             lower_bounds=lower_bounds,
             upper_bounds=upper_bounds,
+            label=label,
         )
         if best is None or result.cost < best.cost:
             best = result
@@ -711,9 +891,11 @@ def fit_family(
         data,
         shots,
         generator_basis=generator_basis,
+        readout_basis=readout_basis,
         fixed_params=fixed_params,
         lower_bounds=lower_bounds,
         upper_bounds=upper_bounds,
+        label=label,
     )
 
     param_names = [name for name in PARAM_NAMES if name not in fixed_params]
@@ -725,7 +907,9 @@ def fit_family(
             data,
             shots,
             generator_basis=generator_basis,
+            readout_basis=readout_basis,
             fixed_params=fixed_params,
+            label=label,
         )
         ** 2
     )
@@ -743,49 +927,20 @@ def fit_family(
     return params
 
 
-SET1_BASIS = construct_generator_basis(
-    np.kron(SIGMA_X, SIGMA_X), _on(SIGMA_X, 0), _on(SIGMA_X, 1)
-)
-SET2_BASIS = construct_generator_basis(
-    np.kron(SIGMA_Y, SIGMA_Y), _on(SIGMA_Y, 0), _on(SIGMA_Y, 1)
-)
-SET4_BASIS = construct_generator_basis(
-    np.kron(SIGMA_X, SIGMA_Y),
-    np.kron(SIGMA_Y, SIGMA_X),
-    np.kron(SIGMA_Z, SIGMA_Z),
-)
-
-
-def generator_basis_for(label: str) -> np.ndarray:
-    """The Hamiltonian basis each db_set drives, as a generator basis.."""
-    if "set1" in label:
-        return SET1_BASIS
-    if "set2" in label:
-        return SET2_BASIS
-    if "set3" in label:
-        return SET1_BASIS
-    if "set4" in label:
-        return SET4_BASIS
-    if "set5" in label:
-        return SET4_BASIS
-    if "qubit_pairq3-6" == label:
-        return SET1_BASIS
-    raise RuntimeError(f"Set1-5 are the only recognized labels. Received {label}")
-
-
 def fixed_params_for(label: str) -> dict:
+    if "ibm" in label:
+        return {"phi": 0.0}
     if label == "qubit_pairq3-6":
         return {"phi": 0.0}
-    return {}
+    return {"phi": 0.0}
 
 
 def bounds_for(label: str) -> tuple[np.ndarray, np.ndarray]:
+    fixed = fixed_params_for(label)
+    keep_idx = [i for i, name in enumerate(PARAM_NAMES) if name not in fixed]
+    lower_bounds = LOWER_BOUNDS[keep_idx]
+    upper_bounds = UPPER_BOUNDS[keep_idx]
     if label == "qubit_pairq3-6":
-        fixed = fixed_params_for(label)
-        keep_idx = [i for i, name in enumerate(PARAM_NAMES) if name not in fixed]
-        lower_bounds = LOWER_BOUNDS[keep_idx]
-        upper_bounds = UPPER_BOUNDS[keep_idx]
-
         # free_names = [name for name in PARAM_NAMES if name not in fixed]
         # decay_floors = {"d1": 0.16, "d2": 0.16, "r1": 0.08, "r2": 0.08}
         # for name, floor in decay_floors.items():
@@ -797,8 +952,74 @@ def bounds_for(label: str) -> tuple[np.ndarray, np.ndarray]:
         #     if name in free_names:
         #         upper_bounds[free_names.index(name)] = cap
         assert np.all(lower_bounds < upper_bounds)
-        return lower_bounds, upper_bounds
-    return LOWER_BOUNDS, UPPER_BOUNDS
+    return lower_bounds, upper_bounds
+
+
+def _phase_flip_is_a_symmetry(family: Family, fixed_params: dict, params: dict) -> bool:
+    """Whether negating every phase leaves this family's model curve unchanged.
+
+    `canonicalize_signs` picks the eps >= 0 branch of a phases -> -phases degeneracy.
+    Which sign flips are degeneracies depends on the set: sets 2 and 3 are blind to
+    all of them (a Z-basis prep and readout commute with ZI and IZ, so only the three
+    magnitudes are identifiable at all), set1 is blind only to the global flip, and
+    sets 4 and 5 are blind to the global flip but *not* to flipping eps or kap on
+    their own. Flip one that is not a degeneracy and the row written to the CSV stops
+    reproducing the fit it came from -- and `plot_family`, which draws that row, plots
+    a curve that misses the data. Rather than tabulate which sets qualify, ask the
+    model.
+
+    "Degenerate" here means the two curves differ by less than the standard error of
+    a single measured probability, since a difference smaller than that is not what
+    the fit resolved: the DD sequences break the global flip in sets 4 and 5 at the
+    1e-3 level through terms that do not commute with the dissipator, which is real
+    but three times under the noise floor at 5000 shots.
+    """
+    x = np.array([params[name] for name in PARAM_NAMES if name not in fixed_params])
+    flipped = np.array(
+        [
+            -value if name in PHASE_NAMES else value
+            for name, value in zip([n for n in PARAM_NAMES if n not in fixed_params], x)
+        ]
+    )
+    kwargs = dict(
+        generator_basis=generator_basis_for(family.label),
+        readout_basis=readout_basis_for(family.label),
+        label=family.label,
+    )
+    a = fidelity_fn(family.n, *construct_full_params(x, fixed_params), **kwargs).real
+    b = fidelity_fn(
+        family.n, *construct_full_params(flipped, fixed_params), **kwargs
+    ).real
+    # 0.5 / sqrt(shots) is the largest standard error a probability can have.
+    return bool(np.allclose(a, b, atol=0.5 / np.sqrt(family.shots), rtol=0))
+
+
+def _canonicalize(fit_params: dict, family: Family, fixed_params: dict) -> dict:
+    """`canonicalize_signs`, but branch-safe and only where the flip is a degeneracy.
+
+    `canonicalize_signs` reads the branch off eps. That works while eps is clearly
+    non-zero, but these fits routinely drive eps and kap to ~1e-8, and then the
+    branch is decided by rounding noise -- two runs of the same data land on
+    eta = +0.0049 and eta = -0.0049 and look like they disagree when they are the
+    same point. Read the branch off the phase with the most magnitude behind it
+    instead; for a fit where eps dominates this is the same rule.
+    """
+    free_phases = {
+        name: value
+        for name, value in fit_params.items()
+        if name in PHASE_NAMES and name not in fixed_params
+    }
+    if not free_phases:
+        return dict(fit_params)
+    branch = max(free_phases, key=lambda name: abs(free_phases[name]))
+    if free_phases[branch] >= 0:
+        return dict(fit_params)
+    if not _phase_flip_is_a_symmetry(family, fixed_params, fit_params):
+        return dict(fit_params)
+    return {
+        name: -value if name in PHASE_NAMES else value
+        for name, value in fit_params.items()
+    }
 
 
 def process_single_family(family: Family, rng) -> list[dict]:
@@ -817,6 +1038,7 @@ def process_single_family(family: Family, rng) -> list[dict]:
     rows = []
     prev_fit_params = None
     generator_basis = generator_basis_for(family.label)
+    readout_basis = readout_basis_for(family.label)
     fixed_params = fixed_params_for(family.label)
     lower_bounds, upper_bounds = bounds_for(family.label)
 
@@ -837,16 +1059,18 @@ def process_single_family(family: Family, rng) -> list[dict]:
                 else init_values
             ),
             generator_basis=generator_basis,
+            readout_basis=readout_basis,
             fixed_params=fixed_params,
             lower_bounds=lower_bounds,
             upper_bounds=upper_bounds,
+            label=family.label,
         )
         row = {
             "family": family.label,
             "repetitions": repetitions,
             "shots": family.shots,
         }
-        row.update(canonicalize_signs(fit_params))
+        row.update(_canonicalize(fit_params, family, fixed_params))
         rows.append(row)
         prev_fit_params = fit_params  # Warm-chaining solutions
         print(
@@ -862,6 +1086,7 @@ def plot_family(
     params: np.ndarray,
     pdf: PdfPages,
     generator_basis: np.ndarray = _GENERATOR_BASIS,
+    readout_basis: np.ndarray | None = None,
     fixed_params: dict | None = None,
     model: np.ndarray | None = None,
 ) -> None:
@@ -872,14 +1097,20 @@ def plot_family(
     dense_n = np.linspace(float(np.min(family.n)), float(np.max(family.n)), PLOT_POINTS)
     x = construct_full_params(params, fixed_params)
     if model is None:
-        model = fidelity_fn(dense_n, *x, generator_basis=generator_basis).real
+        model = fidelity_fn(
+            dense_n,
+            *x,
+            generator_basis=generator_basis,
+            readout_basis=readout_basis,
+            label=family.label,
+        ).real
     fig, axes = plt.subplots(1, 4, figsize=(16, 3.4), sharex=True, sharey=True)
     for idx, (ax, ss) in enumerate(zip(axes, JOINT_STATES)):
-        errs = family.errs[:, idx]
+        errs = family.errs[:, idx] if family.errs is not None else None
         ax.errorbar(
             family.n,
             family.data[:, idx],
-            yerr=None if np.all(np.isnan(errs)) else errs,
+            yerr=None if errs is None or errs is np.all(np.isnan(errs)) else errs,
             fmt="o",
             ms=3,
             lw=1,
@@ -910,16 +1141,35 @@ def plot_family(
 def analyze_experiments(data_path: Path, seed: int = 1, output_dir: Path = OUTPUT_DIR):
     if not data_path.exists():
         raise FileNotFoundError(
-            f"{data_path} does not exist. Pass --data pointing at an h5 file."
+            f"{data_path} does not exist. Pass --data pointing at an h5/csv file."
         )
-    ds_raw = xr.open_dataset(data_path)
-    print("raw vars:", list(ds_raw.data_vars))
-    print("raw dims:", dict(ds_raw.sizes))
+    if data_path.suffix == ".h5":
+        ds_raw = xr.open_dataset(data_path)
+        print("raw vars:", list(ds_raw.data_vars))
+        print("raw dims:", dict(ds_raw.sizes))
 
-    ds = prepare_dataset(ds_raw)
+        ds = prepare_dataset(ds_raw)
+        rng = np.random.default_rng(seed)
+        families = iter_families(ds)
+        print(f"fitting {len(families)} famil{'y' if len(families) == 1 else 'ies'}\n")
+    elif data_path.suffix == ".csv":
+        if not data_path.exists():
+            raise FileNotFoundError(f"{data_path} does not exist.")
+        df = pd.read_csv(data_path)
+        n = df["n"].values
+        shots = (
+            df["shots"].iloc[0]
+            if "shots" in df.columns and len(df["shots"]) > 0
+            else 800
+        )
+        # Try to gather all families (we only support single family here)
+        data = np.stack([df[c].values for c in ["00", "01", "10", "11"]], axis=-1)
+        family = Family("ibm_" + data_path.name, {}, n, data, None, shots)
+        families = [family]
+    else:
+        raise RuntimeError(f"Expected CSV or H5 file. Received {data_path.suffix}")
+
     rng = np.random.default_rng(seed)
-    families = iter_families(ds)
-    print(f"fitting {len(families)} famil{'y' if len(families) == 1 else 'ies'}\n")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     pdf_path = output_dir / "experiment_fit.pdf"
@@ -933,8 +1183,6 @@ def analyze_experiments(data_path: Path, seed: int = 1, output_dir: Path = OUTPU
             }
         )
         for idx, family in enumerate(families):
-            if idx != 0:
-                continue
             family_rows, _ = process_single_family(family, rng)
             rows.extend(family_rows)
 
@@ -945,13 +1193,19 @@ def analyze_experiments(data_path: Path, seed: int = 1, output_dir: Path = OUTPU
                 params,
                 pdf,
                 generator_basis_for(family.label),
+                readout_basis_for(family.label),
                 fixed_params_for(family.label),
             )
             fixed_params = fixed_params_for(family.label)
+            t1, t2 = get_decay_timescale(
+                final["d1"], final["d2"], final["r1"], final["r2"], family.label
+            )
             print(
                 f"  -> {', '.join(f'{k}={final[k]:+.5f}' for k in PARAM_NAMES if k in final)}\n"
                 f"  -> fixed: {', '.join(f'{k}={v:+.5f}' for k, v in fixed_params.items())}\n"
-                f"  -> cost={final['true_cost']:.1f} "
+                f"  -> cost={final['true_cost']:.1f}\n"
+                f"  -> {', '.join(f'{k}={final[k]/2/np.pi/60*1e6:+.5f}' for k in PHASE_NAMES if k in final)}\n"
+                f"  -> t1: {t1}, t2: {t2}\n"
                 f"reduced_chi2={final['reduced_chi2']:.2f} rmse={final['rmse']:.4f}\n"
             )
 

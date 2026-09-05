@@ -249,7 +249,10 @@ def get_fidelities(
     em1,
     ep2,
     em2,
+    phi,
     generator_basis: np.ndarray = _GENERATOR_BASIS,
+    readout_basis: np.ndarray = None,
+    label: str | None = None,
 ) -> np.ndarray:
     """
     All four fidelities at once, shape (len(n), 4) with columns ordered as `STATES`.
@@ -272,8 +275,8 @@ def get_fidelities(
     unit_op = construct_unit_operator(
         eta, eps, kap, d1, d2, r1, r2, generator_basis=generator_basis
     )
-    state = construct_init_state().astype(complex)
-    msmt_ops = construct_msmt_op(ep1, em1, ep2, em2)
+    state = construct_init_state(readout_basis).astype(complex)
+    msmt_ops = construct_msmt_op(ep1, em1, ep2, em2, readout_basis)
 
     # exp(G t) s0 = V diag(exp(w t)) V^-1 s0, so one eigendecomposition of the (16, 16)
     # generator gives *every* time step: fold V^-1 s0 and msmt_ops @ V into a single
@@ -334,7 +337,9 @@ def residuals(
     shots: int,
     weight_probs: np.ndarray | None = None,
     generator_basis: np.ndarray = _GENERATOR_BASIS,
+    readout_basis: np.ndarray = None,
     fixed_params: dict | None = None,
+    label: str | None = None,
 ) -> np.ndarray:
     """Whitened residual vector for `least_squares`.
 
@@ -355,7 +360,13 @@ def residuals(
         Pass an array to hold them fixed, as the iterated GLS passes in `fit_joint` do.
     """
     x_full = construct_full_params(x, fixed_params)
-    model_data = get_fidelities(n, *x_full, generator_basis=generator_basis).real
+    model_data = get_fidelities(
+        n,
+        *x_full,
+        generator_basis=generator_basis,
+        readout_basis=readout_basis,
+        label=label,
+    ).real
     probs = model_data if weight_probs is None else weight_probs
     diffs = model_data - data
     return (
