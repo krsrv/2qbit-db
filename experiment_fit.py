@@ -323,7 +323,9 @@ _MAX_EIGENBASIS_COND = 1e8
 
 
 @lru_cache(maxsize=8)
-def _eigendecompose(key: bytes, dim: int) -> tuple[np.ndarray, np.ndarray, str]:
+def _eigendecompose(
+    key: bytes, dim: int, kind: str
+) -> tuple[np.ndarray, np.ndarray, str]:
     """Eigendecomposition of the (dim, dim) complex matrix whose buffer is `key`.
 
     Returns (eigenvalues, eigenvectors, mode), where mode tells `evolve` how to
@@ -331,23 +333,32 @@ def _eigendecompose(key: bytes, dim: int) -> tuple[np.ndarray, np.ndarray, str]:
     it has to be inverted, "expm" if it is too ill-conditioned to use at all (then the
     first two entries are None).
 
+    `kind` is what the caller already knows about the matrix: "hamiltonian" for the
+    anti-Hermitian generator of a coherent rotation, "dissipator" for one that is
+    neither, "unknown" to work it out.
+
     Keyed on the raw bytes so that repeated calls with the *same* Liouvillian at
     different times share one decomposition; the arrays are handed out read-only
     because every caller gets the same objects back.
     """
     L = np.frombuffer(key, dtype=complex).reshape(dim, dim)
-    # Use `eigh` on Hermitian and anti-Hermitian superoperators to avould singularities
+    # Use `eigh` on Hermitian and anti-Hermitian superoperators to avoid singularities
     # in calculating eigenvalues.
-    if np.allclose(L, -L.conj().T):
+    anti_hermitian = kind == "hamiltonian" or (
+        kind == "unknown" and np.allclose(L, -L.conj().T)
+    )
+    if anti_hermitian:
         mu, eigenvectors = np.linalg.eigh(1j * L)
         eigenvalues, mode = -1j * mu, "unitary"
-    elif np.allclose(L, L.conj().T):
+    elif kind == "unknown" and np.allclose(L, L.conj().T):
         values, eigenvectors = np.linalg.eigh(L)
         eigenvalues, mode = values.astype(complex), "unitary"
     else:
         # Usually for the dissipator.
         eigenvalues, eigenvectors = np.linalg.eig(L)
-        if np.linalg.cond(eigenvectors) > _MAX_EIGENBASIS_COND:
+        # 1-norm rather than the default 2-norm: it is an LU rather than an SVD, and
+        # the two agree to within a factor of dim, which decides nothing at 1e8.
+        if np.linalg.cond(eigenvectors, 1) > _MAX_EIGENBASIS_COND:
             return None, None, "expm"
         mode = "solve"
     eigenvalues.flags.writeable = False
@@ -355,18 +366,17 @@ def _eigendecompose(key: bytes, dim: int) -> tuple[np.ndarray, np.ndarray, str]:
     return eigenvalues, eigenvectors, mode
 
 
-def evolve(L: np.ndarray, t: float):
+def evolve(L: np.ndarray, t: float, kind: str = "unknown"):
     """Given a time-constant Louivillian in superoperator form (d^2 x d^2), get the propogator for
     corresponding to time t"""
     # exp(L t) = V diag(exp(w t)) V^-1
     # Scale the columns of V by exp(w t) and solve against V.T rather than forming
     # V^-1. Same trick as `get_fidelities`.
     #
-    # It also amortizes across calls: `gate_residual` evolves one dissipator at
-    # tq_gt once and at sq_gt three times, and the cache turns those four calls into a
-    # single eig.
+    # It also amortizes across calls: `construct_unit_op` evolves one dissipator at
+    # both of the sequence's dwell times, and the cache turns those into a single eig.
     L = np.ascontiguousarray(L, dtype=complex)
-    eigenvalues, eigenvectors, mode = _eigendecompose(L.tobytes(), L.shape[0])
+    eigenvalues, eigenvectors, mode = _eigendecompose(L.tobytes(), L.shape[0], kind)
     if mode == "expm":
         return expm(L * t)
     scaled = eigenvectors * np.exp(eigenvalues * t)
@@ -562,20 +572,51 @@ def _decay_super(d1, d2, r1, r2) -> np.ndarray:
     )
 
 
+class _Compiled(NamedTuple):
+    """A `Sequence` with everything independent of the fit parameters worked out.
+
+    `construct_unit_op` runs on every residual and every finite-difference column of
+    every restart, so it should not be rebuilding the same fixed matrices each time.
+    """
+
+    steps: tuple  # (pulse superoperator, is_cz, dwell_ns)
+    err_supers: tuple  # the (eta, eps, kap) Hamiltonian superoperators
+    dwells: tuple  # the distinct dwell times, of which there are only two
+
+
+@lru_cache(maxsize=None)
+def _compiled(label: str) -> _Compiled:
+    blocks = sequence_for(label).blocks
+    err_ops = next(ops for _, ops, _ in blocks if ops is not None)
+    return _Compiled(
+        steps=tuple(
+            (_super(pulse), ops is not None, dwell) for pulse, ops, dwell in blocks
+        ),
+        err_supers=tuple(_hamiltonian_super(op) for op in err_ops),
+        dwells=tuple({dwell for _, _, dwell in blocks}),
+    )
+
+
 def construct_unit_op(label: str, eta, eps, kap, d1, d2, r1, r2) -> np.ndarray:
     """Superoperator of one full repetition of `label`'s sequence."""
+    sequence = _compiled(label)
     dissipator = _decay_super(d1, d2, r1, r2)
+    # Every block dwells for one of two durations, and every CZ carries the same
+    # coherent error, so three propagators cover the whole repetition.
+    decay = {
+        dwell: evolve(dissipator, dwell, "dissipator") for dwell in sequence.dwells
+    }
+    error = evolve(
+        eta * sequence.err_supers[0]
+        + eps * sequence.err_supers[1]
+        + kap * sequence.err_supers[2],
+        1,
+        "hamiltonian",
+    )
     half = np.eye(DIM**2, dtype=complex)
-    for pulse, err_ops, dwell in sequence_for(label).blocks:
-        block = _super(pulse)
-        if err_ops is not None:
-            coherent = (
-                eta * _hamiltonian_super(err_ops[0])
-                + eps * _hamiltonian_super(err_ops[1])
-                + kap * _hamiltonian_super(err_ops[2])
-            )
-            block = evolve(coherent, 1) @ block
-        half = (evolve(dissipator, dwell) @ block) @ half
+    for pulse, is_cz, dwell in sequence.steps:
+        block = error @ pulse if is_cz else pulse
+        half = (decay[dwell] @ block) @ half
     return half @ half
 
 
