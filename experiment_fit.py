@@ -12,7 +12,6 @@ from matplotlib.backends.backend_pdf import PdfPages
 from scipy.linalg import expm
 from scipy.optimize import least_squares
 
-from get_error_bars import PHASE_NAMES
 from least_squares import (
     _GENERATOR_BASIS,
     MIN_WEIGHT_PROB,
@@ -42,6 +41,9 @@ HERE = Path().cwd()
 JOINT_STATES = ("00", "01", "10", "11")
 SHOT_DIM_CANDIDATES = ("shot", "n", "N")
 _SET_VAR_RE = re.compile(r"^state_(control|target)_s(\d+)_(\d+)$")
+
+# Every coefficient of a term in the coherent-error Hamiltonian.
+PHASE_NAMES = ["eta", "eps", "kap", "z1", "z2"]
 
 
 ############
@@ -143,11 +145,11 @@ def process_ds_raw(ds: xr.Dataset) -> xr.Dataset:
 ############
 # Analysis functions
 ############
-# eta, eps, kap | d1, d2 | r1, r2 | ep1, em1, ep2, em2 | phi
+# eta, eps, kap | d1, d2 | r1, r2 | ep1, em1, ep2, em2 | z1, z2
 # Params: Coherent errors, sigma_z decay rate, sigma_- decay rate, readout + prep error
-# rates, leakage coupling.
-LOWER_BOUNDS = np.array([-np.pi] * 3 + [0.0] * 4 + [0.0] * 4 + [-0.3])
-UPPER_BOUNDS = np.array([np.pi] * 3 + [1.0] * 4 + [0.3] * 4 + [0.3])
+# rates, un-refocused single-qubit Z residual.
+LOWER_BOUNDS = np.array([-0.1] * 3 + [0.0] * 4 + [0.0] * 4 + [-0.1] * 2)
+UPPER_BOUNDS = np.array([0.1] * 3 + [1.0] * 4 + [0.3] * 4 + [0.1] * 2)
 
 N_RESTARTS = 20
 GLS_PASSES = 2
@@ -262,7 +264,7 @@ def construct_init_values(
     Returns:
         np.ndarray: Array of initial parameter values (with fixed-value entries removed).
     """
-    # eta, eps, kap | d1, d2, r1, r2 | ep1, em1, ep2, em2 | phi
+    # eta, eps, kap | d1, d2, r1, r2 | ep1, em1, ep2, em2 | z1, z2
     t2, t1 = [11000, 21000], [10000, 30000]
     discard_idx = [i for i, name in enumerate(PARAM_NAMES) if name in fixed_params]
     if "set1" in family.label:
@@ -302,7 +304,7 @@ def construct_init_values(
         [
             params,
             rng.uniform(0, 0.1, size=4),
-            rng.uniform(-PHI_INIT_SCALE, PHI_INIT_SCALE, size=1),
+            rng.uniform(-Z_INIT_SCALE, Z_INIT_SCALE, size=2),
         ]
     )
     if discard_idx:
@@ -405,7 +407,9 @@ E2 = np.array([[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 2.0 - 0.05]], dtype=
 # INT = np.zeros((DIM, DIM), dtype=complex)
 # INT[4, 2] = INT[2, 4] = 1.0
 
-PHI_INIT_SCALE = 0.02
+Z_INIT_SCALE = 0.02
+
+_Z_RESIDUAL = np.array([_on(SIGMA_Z, 0), _on(SIGMA_Z, 1)])
 
 
 # DD pulses, as 4x4 unitaries. `_super` turns one into the superoperator
@@ -466,6 +470,7 @@ class Sequence(NamedTuple):
 
     blocks: tuple  # (pulse 4x4, err_ops or None, dwell_ns)
     rot: np.ndarray | None  # pre-measurement rotation, None for the Z basis
+    residual: np.ndarray | None
 
 
 def _cz_block(err_ops, ideal=_II):
@@ -503,6 +508,7 @@ SEQUENCES = {
             _pulse_block(_IX),
         ),
         None,
+        None,
     ),
     "set2": Sequence(
         (
@@ -512,6 +518,7 @@ SEQUENCES = {
             _pulse_block(_IY),
         ),
         None,
+        _Z_RESIDUAL,
     ),
     "set3": Sequence(
         (
@@ -521,6 +528,7 @@ SEQUENCES = {
             _pulse_block(_IX),
         ),
         None,
+        _Z_RESIDUAL,
     ),
     "set4": Sequence(
         (
@@ -534,6 +542,7 @@ SEQUENCES = {
             _pulse_block(_XY),
         ),
         construct_readout_rotation(LEVELS),
+        None,
     ),
     "set5": Sequence(
         (
@@ -547,6 +556,7 @@ SEQUENCES = {
             _pulse_block(_XY),
         ),
         construct_readout_rotation(LEVELS),
+        None,
     ),
 }
 
@@ -582,22 +592,28 @@ class _Compiled(NamedTuple):
     steps: tuple  # (pulse superoperator, is_cz, dwell_ns)
     err_supers: tuple  # the (eta, eps, kap) Hamiltonian superoperators
     dwells: tuple  # the distinct dwell times, of which there are only two
+    residual_supers: tuple  # the (z1, z2) Hamiltonian superoperators, or ()
 
 
 @lru_cache(maxsize=None)
 def _compiled(label: str) -> _Compiled:
-    blocks = sequence_for(label).blocks
+    sequence = sequence_for(label)
+    blocks = sequence.blocks
     err_ops = next(ops for _, ops, _ in blocks if ops is not None)
+    residual = sequence.residual
     return _Compiled(
         steps=tuple(
             (_super(pulse), ops is not None, dwell) for pulse, ops, dwell in blocks
         ),
         err_supers=tuple(_hamiltonian_super(op) for op in err_ops),
         dwells=tuple({dwell for _, _, dwell in blocks}),
+        residual_supers=(
+            () if residual is None else tuple(_hamiltonian_super(op) for op in residual)
+        ),
     )
 
 
-def construct_unit_op(label: str, eta, eps, kap, d1, d2, r1, r2) -> np.ndarray:
+def construct_unit_op(label: str, eta, eps, kap, z1, z2, d1, d2, r1, r2) -> np.ndarray:
     """Superoperator of one full repetition of `label`'s sequence."""
     sequence = _compiled(label)
     dissipator = _decay_super(d1, d2, r1, r2)
@@ -613,11 +629,23 @@ def construct_unit_op(label: str, eta, eps, kap, d1, d2, r1, r2) -> np.ndarray:
         1,
         "hamiltonian",
     )
-    half = np.eye(DIM**2, dtype=complex)
-    for pulse, is_cz, dwell in sequence.steps:
+    residual_gen = (
+        z1 * sequence.residual_supers[0] + z2 * sequence.residual_supers[1]
+        if sequence.residual_supers
+        else None
+    )
+    frame = np.eye(DIM**2, dtype=complex)
+    unit = np.eye(DIM**2, dtype=complex)
+    for pulse, is_cz, dwell in sequence.steps * 2:
         block = error @ pulse if is_cz else pulse
-        half = (decay[dwell] @ block) @ half
-    return half @ half
+        frame = pulse @ frame
+        step = decay[dwell] @ block
+        if residual_gen is not None:
+            step = (
+                evolve(frame @ residual_gen @ frame.conj().T, 1, "hamiltonian") @ step
+            )
+        unit = step @ unit
+    return unit
 
 
 @lru_cache(maxsize=None)
@@ -643,8 +671,9 @@ def effective_generator_basis(label: str) -> np.ndarray:
     # not compose back to the identity, so the second half runs in a frame the first
     # half left rotated. For set2 that is the difference between relaxation coming
     # out 1/3 sigma^- and 2/3 sigma^+ and its true even split.
-    blocks = sequence_for(label).blocks * 2
-    basis = np.zeros((7, DIM**2, DIM**2), dtype=complex)
+    sequence = sequence_for(label)
+    blocks = sequence.blocks * 2
+    basis = np.zeros((9, DIM**2, DIM**2), dtype=complex)
     frame = np.eye(DIM**2, dtype=complex)
     for pulse, err_ops, dwell in blocks:
         frame = _super(pulse) @ frame
@@ -653,6 +682,9 @@ def effective_generator_basis(label: str) -> np.ndarray:
                 basis[k] += frame.conj().T @ _hamiltonian_super(op) @ frame
         for k in range(4):
             basis[3 + k] += 1e-3 * dwell * (frame.conj().T @ DECAY_BASIS[k] @ frame)
+        if sequence.residual is not None:
+            for k, op in enumerate(sequence.residual):
+                basis[7 + k] += _hamiltonian_super(op)
     # `get_fidelities` exponentiates for 4 * n, four gates per repetition.
     basis /= 4
     # Every caller shares the cached array.
@@ -683,7 +715,8 @@ def new_gate_fidelities(
     em1,
     ep2,
     em2,
-    phi,
+    z1,
+    z2,
     generator_basis: np.ndarray = _GENERATOR_BASIS,
     readout_basis: np.ndarray = None,
     label: str | None = None,
@@ -698,7 +731,7 @@ def new_gate_fidelities(
         n = np.arange(n)
     n = np.asarray(n, dtype=float)
 
-    unit_op = construct_unit_op(label, eta, eps, kap, d1, d2, r1, r2)
+    unit_op = construct_unit_op(label, eta, eps, kap, z1, z2, d1, d2, r1, r2)
     rot = readout_basis_for(label)
 
     state = construct_init_state(rot, LEVELS).astype(complex)
@@ -856,7 +889,7 @@ def construct_x_trial(
     Returns:
         np.ndarray: A parameter vector suitable for passing to the solver.
     """
-    # eta, eps, kap | d1, d2, r1, r2 | ep1, em1, ep2, em2 | phi
+    # eta, eps, kap | d1, d2, r1, r2 | ep1, em1, ep2, em2 | z1, z2
     discard_idx = [i for i, name in enumerate(PARAM_NAMES) if name in fixed_params]
     # d and r are rates in 1/us in both methods, so one set of scales covers both.
     if x0 is None:
@@ -865,7 +898,7 @@ def construct_x_trial(
                 rng.uniform(-0.02, 0.02, size=3),
                 rng.uniform(0.0, 1 / 100, size=4),
                 rng.uniform(0.0, 0.2, size=4),
-                rng.uniform(-PHI_INIT_SCALE, PHI_INIT_SCALE, size=1),
+                rng.uniform(-Z_INIT_SCALE, Z_INIT_SCALE, size=2),
             ]
         )
         if discard_idx:
@@ -878,7 +911,7 @@ def construct_x_trial(
                 rng.uniform(-0.01, 0.01, size=3),
                 rng.uniform(0, 0.01, size=4),
                 rng.uniform(0, 0.001, size=4),
-                rng.uniform(-PHI_INIT_SCALE, PHI_INIT_SCALE, size=1),
+                rng.uniform(-Z_INIT_SCALE, Z_INIT_SCALE, size=2),
             ]
         )
         if discard_idx:
@@ -969,11 +1002,9 @@ def fit_family(
 
 
 def fixed_params_for(label: str) -> dict:
-    if "ibm" in label:
-        return {"phi": 0.0}
-    if label == "qubit_pairq3-6":
-        return {"phi": 0.0}
-    return {"phi": 0.0}
+    if ("set1" in label) or ("set4" in label) or ("set5" in label):
+        return {"z1": 0.0, "z2": 0.0}
+    return {}
 
 
 def bounds_for(label: str) -> tuple[np.ndarray, np.ndarray]:
@@ -1000,14 +1031,14 @@ def _phase_flip_is_a_symmetry(family: Family, fixed_params: dict, params: dict) 
     """Whether negating every phase leaves this family's model curve unchanged.
 
     `canonicalize_signs` picks the eps >= 0 branch of a phases -> -phases degeneracy.
-    Which sign flips are degeneracies depends on the set: sets 2 and 3 are blind to
-    all of them (a Z-basis prep and readout commute with ZI and IZ, so only the three
-    magnitudes are identifiable at all), set1 is blind only to the global flip, and
-    sets 4 and 5 are blind to the global flip but *not* to flipping eps or kap on
-    their own. Flip one that is not a degeneracy and the row written to the CSV stops
-    reproducing the fit it came from -- and `plot_family`, which draws that row, plots
-    a curve that misses the data. Rather than tabulate which sets qualify, ask the
-    model.
+    Which sign flips are degeneracies depends on the set: set1 is blind to the global
+    flip, and sets 4 and 5 are blind to it but not to flipping eps or kap on their
+    own. Sets 2 and 3 are blind to it only when z1 and z2 flip along with the error
+    triple: the residual does not commute with the triple, so their relative sign is
+    physical and negating either group alone moves the curve by ~1e-1. Flip one that
+    is not a degeneracy and the row written to the CSV stops reproducing the fit it
+    came from -- and `plot_family`, which draws that row, plots a curve that misses
+    the data. Rather than tabulate which sets qualify, ask the model.
 
     "Degenerate" here means the two curves differ by less than the standard error of
     a single measured probability, since a difference smaller than that is not what
@@ -1224,6 +1255,8 @@ def analyze_experiments(data_path: Path, seed: int = 1, output_dir: Path = OUTPU
             }
         )
         for idx, family in enumerate(families):
+            if idx not in [1, 2]:
+                continue
             family_rows, _ = process_single_family(family, rng)
             rows.extend(family_rows)
 
@@ -1245,7 +1278,7 @@ def analyze_experiments(data_path: Path, seed: int = 1, output_dir: Path = OUTPU
                 f"  -> {', '.join(f'{k}={final[k]:+.5f}' for k in PARAM_NAMES if k in final)}\n"
                 f"  -> fixed: {', '.join(f'{k}={v:+.5f}' for k, v in fixed_params.items())}\n"
                 f"  -> cost={final['true_cost']:.1f}\n"
-                f"  -> {', '.join(f'{k}={final[k]/2/np.pi/60*1e6:+.5f}' for k in PHASE_NAMES if k in final)}\n"
+                f"  -> {', '.join(f'{k}={final[k]/2/np.pi/60*1e6:+.5f}' for k in ('eta', 'eps', 'kap') if k in final)}\n"
                 f"  -> t1: {t1}, t2: {t2}\n"
                 f"reduced_chi2={final['reduced_chi2']:.2f} rmse={final['rmse']:.4f}\n"
             )

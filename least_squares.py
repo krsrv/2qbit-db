@@ -34,7 +34,8 @@ PARAM_NAMES = [
     "em1",
     "ep2",
     "em2",
-    "phi",
+    "z1",
+    "z2",
 ]
 
 # ---------------------------------------------------------------------------
@@ -143,7 +144,7 @@ def _readout_bin(level: int) -> int:
 # The generator is *linear* in (eta, eps, kap, d1**2, d2**2, r1**2, r2**2): each Hamiltonian
 # term carries one phase parameter, and each jump operator is a fixed matrix scaled by
 # its rate, so its dissipator is quadratic in that rate. Build the seven 16x16 basis
-# superoperators once at import; construct_unit_operator is then a single (256, 7) @ (7,)
+# superoperators once at import; construct_unit_operator is then a single (256, 9) @ (9,)
 # product rather than the ~20 np.kron calls it used to cost on every residual evaluation.
 _GENERATOR_BASIS = np.array(
     [
@@ -154,6 +155,8 @@ _GENERATOR_BASIS = np.array(
         _dissipator_super(0.5 * _on(SIGMA_Z, 1)),  # scaled by d2
         _dissipator_super(2.0 * _on(SIGMA_MINUS, 0)),  # scaled by r1
         _dissipator_super(2.0 * _on(SIGMA_MINUS, 1)),  # scaled by r2
+        _hamiltonian_super(_on(SIGMA_Z, 0)),  # z1
+        _hamiltonian_super(_on(SIGMA_Z, 1)),  # z2
     ],
     dtype=complex,
 )
@@ -169,13 +172,15 @@ def construct_generator_basis(op1, op2, op3):
             _dissipator_super(0.5 * _on(SIGMA_Z, 1)),  # scaled by d2
             _dissipator_super(2.0 * _on(SIGMA_MINUS, 0)),  # scaled by r1
             _dissipator_super(2.0 * _on(SIGMA_MINUS, 1)),  # scaled by r2
+            _hamiltonian_super(_on(SIGMA_Z, 0)),  # z1
+            _hamiltonian_super(_on(SIGMA_Z, 1)),  # z2
         ],
         dtype=complex,
     )
 
 
 def construct_unit_operator(
-    eta, eps, kap, d1, d2, r1, r2, generator_basis: np.ndarray = _GENERATOR_BASIS
+    eta, eps, kap, z1, z2, d1, d2, r1, r2, generator_basis: np.ndarray = _GENERATOR_BASIS
 ) -> np.ndarray:
     """The (16, 16) Lindblad generator of one time step as a superoperator.
 
@@ -184,8 +189,8 @@ def construct_unit_operator(
     - H = eta ZZ + eps ZI + kap IZ
     - c_k = 1/2 d1 Z_1, 1/2 d2 Z_2, 2 r1 sigma^-_1, 2 r2 sigma^-_2
     """
-    coefficients = np.array([eta, eps, kap, d1, d2, r1, r2], dtype=complex)
-    return (generator_basis.reshape(7, -1).T @ coefficients).reshape(16, 16)
+    coefficients = np.array([eta, eps, kap, d1, d2, r1, r2, z1, z2], dtype=complex)
+    return (generator_basis.reshape(9, -1).T @ coefficients).reshape(16, 16)
 
 
 def construct_ideal_msmt_ops(
@@ -249,7 +254,8 @@ def get_fidelities(
     em1,
     ep2,
     em2,
-    phi,
+    z1,
+    z2,
     generator_basis: np.ndarray = _GENERATOR_BASIS,
     readout_basis: np.ndarray = None,
     label: str | None = None,
@@ -273,7 +279,7 @@ def get_fidelities(
     n = np.asarray(n, dtype=float)
 
     unit_op = construct_unit_operator(
-        eta, eps, kap, d1, d2, r1, r2, generator_basis=generator_basis
+        eta, eps, kap, z1, z2, d1, d2, r1, r2, generator_basis=generator_basis
     )
     state = construct_init_state(readout_basis).astype(complex)
     msmt_ops = construct_msmt_op(ep1, em1, ep2, em2, readout_basis)
