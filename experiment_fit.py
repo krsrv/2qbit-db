@@ -148,8 +148,8 @@ def process_ds_raw(ds: xr.Dataset) -> xr.Dataset:
 # eta, eps, kap | d1, d2 | r1, r2 | ep1, em1, ep2, em2 | z1, z2
 # Params: Coherent errors, sigma_z decay rate, sigma_- decay rate, readout + prep error
 # rates, un-refocused single-qubit Z residual.
-LOWER_BOUNDS = np.array([-0.1] * 3 + [0.0] * 4 + [0.0] * 4 + [-0.1] * 2)
-UPPER_BOUNDS = np.array([0.1] * 3 + [1.0] * 4 + [0.3] * 4 + [0.1] * 2)
+LOWER_BOUNDS = np.array([-0.3] * 3 + [0.0] * 4 + [0.0] * 4 + [-0.3] * 2)
+UPPER_BOUNDS = np.array([0.3] * 3 + [1.0] * 4 + [0.3] * 4 + [0.3] * 2)
 
 N_RESTARTS = 20
 GLS_PASSES = 2
@@ -271,10 +271,8 @@ def construct_init_values(
         zi, iz = (0.9725 - 1) * 2 * np.pi, 0.2330 * 2 * np.pi
         params = np.concatenate(
             [
-                rng.uniform(0, 0.01, size=1),
-                rng.uniform(0, 0.1, size=2),
-                # zi,
-                # iz,
+                rng.uniform(0, 0.3, size=1),
+                rng.uniform(0, 0.3, size=2),  # zi, iz
                 _decay_init(t2, t1),
             ]
         )
@@ -407,7 +405,7 @@ E2 = np.array([[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 2.0 - 0.05]], dtype=
 # INT = np.zeros((DIM, DIM), dtype=complex)
 # INT[4, 2] = INT[2, 4] = 1.0
 
-Z_INIT_SCALE = 0.02
+Z_INIT_SCALE = 0.2
 
 _Z_RESIDUAL = np.array([_on(SIGMA_Z, 0), _on(SIGMA_Z, 1)])
 
@@ -542,7 +540,7 @@ SEQUENCES = {
             _pulse_block(_XY),
         ),
         construct_readout_rotation(LEVELS),
-        None,
+        np.array([np.kron(SIGMA_Z, SIGMA_Z), _on(SIGMA_Z, 1)]),
     ),
     "set5": Sequence(
         (
@@ -556,7 +554,7 @@ SEQUENCES = {
             _pulse_block(_XY),
         ),
         construct_readout_rotation(LEVELS),
-        None,
+        np.array([np.kron(SIGMA_Z, SIGMA_Z), _on(SIGMA_Z, 1)]),
     ),
 }
 
@@ -773,7 +771,7 @@ def gate_residuals(
     ).reshape(-1)
 
 
-METHOD = "model_dd"
+METHOD = "mix"
 if METHOD == "model_dd":
     residual_fn = gate_residuals  # residuals
     fidelity_fn = new_gate_fidelities  # get_fidelities
@@ -1002,8 +1000,10 @@ def fit_family(
 
 
 def fixed_params_for(label: str) -> dict:
-    if ("set1" in label) or ("set4" in label) or ("set5" in label):
+    if "set1" in label:
         return {"z1": 0.0, "z2": 0.0}
+    if ("set4" in label) or ("set5" in label):
+        return {"z2": 0.0}
     return {}
 
 
@@ -1210,7 +1210,7 @@ def plot_family(
     plt.close(fig)
 
 
-def analyze_experiments(data_path: Path, seed: int = 1, output_dir: Path = OUTPUT_DIR):
+def analyze_experiments(data_path: Path, seed: int, output_prefix: Path):
     if not data_path.exists():
         raise FileNotFoundError(
             f"{data_path} does not exist. Pass --data pointing at an h5/csv file."
@@ -1243,8 +1243,10 @@ def analyze_experiments(data_path: Path, seed: int = 1, output_dir: Path = OUTPU
 
     rng = np.random.default_rng(seed)
 
+    # Create the output_dir as the parent directory of output_prefix, and a pdf path at output_prefix with ".pdf" extension
+    output_dir = output_prefix.parent
     output_dir.mkdir(parents=True, exist_ok=True)
-    pdf_path = output_dir / "experiment_fit.pdf"
+    pdf_path = output_prefix.with_suffix(".pdf")
 
     rows = []
     with PdfPages(pdf_path) as pdf:
@@ -1255,8 +1257,6 @@ def analyze_experiments(data_path: Path, seed: int = 1, output_dir: Path = OUTPU
             }
         )
         for idx, family in enumerate(families):
-            if idx not in [1, 2]:
-                continue
             family_rows, _ = process_single_family(family, rng)
             rows.extend(family_rows)
 
@@ -1278,12 +1278,12 @@ def analyze_experiments(data_path: Path, seed: int = 1, output_dir: Path = OUTPU
                 f"  -> {', '.join(f'{k}={final[k]:+.5f}' for k in PARAM_NAMES if k in final)}\n"
                 f"  -> fixed: {', '.join(f'{k}={v:+.5f}' for k, v in fixed_params.items())}\n"
                 f"  -> cost={final['true_cost']:.1f}\n"
-                f"  -> {', '.join(f'{k}={final[k]/2/np.pi/60*1e6:+.5f}' for k in ('eta', 'eps', 'kap') if k in final)}\n"
+                f"  -> {', '.join(f'{k}={final[k]/2/np.pi/TQ_GT*1e6:+.5f}' for k in PHASE_NAMES if k in final)}\n"
                 f"  -> t1: {t1}, t2: {t2}\n"
                 f"reduced_chi2={final['reduced_chi2']:.2f} rmse={final['rmse']:.4f}\n"
             )
 
-    csv_path = output_dir / "experiment_fit.csv"
+    csv_path = output_prefix.with_suffix(".csv")
     frame = pd.DataFrame([{k: v for k, v in r.items() if k != "result"} for r in rows])
     frame.to_csv(csv_path, index=False)
     print(
@@ -1303,6 +1303,18 @@ if __name__ == "__main__":
         required=True,
         help="Input file path (h5)",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=1,
+        help="Seed",
+    )
+    parser.add_argument(
+        "--output-prefix",
+        type=Path,
+        required=True,
+        help="Output file path (folder + prefix). The generated files will be .pdf and .csv",
+    )
     args = parser.parse_args()
 
-    analyze_experiments(args.data)
+    analyze_experiments(args.data, args.seed, args.output_prefix)

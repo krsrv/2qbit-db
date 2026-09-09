@@ -39,7 +39,7 @@ def construct_noisy_data(data, sigma=None, rng=None):
 
 
 # Every coefficient of a term in the coherent-error Hamiltonian.
-PHASE_NAMES = ["eta", "eps", "kap", "phi"]
+PHASE_NAMES = ["eta", "eps", "kap", "z1", "z2"]
 
 
 def canonicalize_signs(params):
