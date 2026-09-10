@@ -494,7 +494,15 @@ def _pulse_block(u):
 #   set4 -> ZX, XY, YZ      set5 -> XZ, YX, ZY
 SEQUENCES = {
     # H CZ H  X  H CZ H  X, with the ideal CZ kept (it commutes with the error).
-    "set1": Sequence(
+    "qubit_pairq3-6": Sequence(
+        (
+            _cz_block(_ZZ_ERR, ideal=CZ),
+            _cz_block(_ZZ_ERR, ideal=CZ),
+        ),
+        construct_readout_rotation(LEVELS),
+        _Z_RESIDUAL,
+    ),
+    "db_set1_qubit_pairq3-6": Sequence(
         (
             _pulse_block(_HH),
             _cz_block(_ZZ_ERR, ideal=CZ),
@@ -508,7 +516,7 @@ SEQUENCES = {
         None,
         None,
     ),
-    "set2": Sequence(
+    "db_set2_qubit_pairq3-6": Sequence(
         (
             _cz_block(_YY_ERR),
             _pulse_block(_YI),
@@ -518,7 +526,7 @@ SEQUENCES = {
         None,
         _Z_RESIDUAL,
     ),
-    "set3": Sequence(
+    "db_set3_qubit_pairq3-6": Sequence(
         (
             _cz_block(_XX_ERR),
             _pulse_block(_XI),
@@ -528,7 +536,7 @@ SEQUENCES = {
         None,
         _Z_RESIDUAL,
     ),
-    "set4": Sequence(
+    "db_set4_qubit_pairq3-6": Sequence(
         (
             _pulse_block(_IH),
             _cz_block(_SET4_ERR),
@@ -542,7 +550,7 @@ SEQUENCES = {
         construct_readout_rotation(LEVELS),
         np.array([np.kron(SIGMA_Z, SIGMA_Z), _on(SIGMA_Z, 1)]),
     ),
-    "set5": Sequence(
+    "db_set5_qubit_pairq3-6": Sequence(
         (
             _pulse_block(_HI),
             _cz_block(_SET5_ERR),
@@ -1000,7 +1008,7 @@ def fit_family(
 
 
 def fixed_params_for(label: str) -> dict:
-    if "set1" in label:
+    if "set1" in label or label == "qubit_pairq3-6":
         return {"z1": 0.0, "z2": 0.0}
     if ("set4" in label) or ("set5" in label):
         return {"z2": 0.0}
@@ -1257,6 +1265,8 @@ def analyze_experiments(data_path: Path, seed: int, output_prefix: Path):
             }
         )
         for idx, family in enumerate(families):
+            if idx != 0:
+                continue
             family_rows, _ = process_single_family(family, rng)
             rows.extend(family_rows)
 
