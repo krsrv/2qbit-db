@@ -424,8 +424,12 @@ _XI = np.kron(SIGMA_X, np.eye(2))
 _IX = np.kron(np.eye(2), SIGMA_X)
 _YI = np.kron(SIGMA_Y, np.eye(2))
 _IY = np.kron(np.eye(2), SIGMA_Y)
+_IZ = np.kron(np.eye(2), SIGMA_Z)
+_ZI = np.kron(SIGMA_Z, np.eye(2))
 _XY = _XI @ _IY
 _YX = _YI @ _IX
+_ZX = _ZI @ _IX
+_XZ = _XI @ _IZ
 _HH = np.kron(H, H)
 _IH = np.kron(np.eye(2), H)
 _HI = np.kron(H, np.eye(2))
@@ -538,39 +542,42 @@ SEQUENCES = {
     ),
     "db_set4_qubit_pairq3-6": Sequence(
         (
-            _pulse_block(_IH),
+            # _pulse_block(_IH),
             _cz_block(_SET4_ERR),
-            _pulse_block(_IH),
-            _pulse_block(_YX),
-            _pulse_block(_IH),
+            # _pulse_block(_IH),
+            _pulse_block(_ZX),
+            # _pulse_block(_IH),
             _cz_block(_SET4_ERR),
-            _pulse_block(_IH),
+            # _pulse_block(_IH),
             _pulse_block(_XY),
         ),
-        construct_readout_rotation(LEVELS),
-        np.array([np.kron(SIGMA_Z, SIGMA_Z), _on(SIGMA_Z, 1)]),
+        None,
+        _Z_RESIDUAL,  # np.array([np.kron(SIGMA_Z, SIGMA_Z), _on(SIGMA_Z, 1)]),
     ),
     "db_set5_qubit_pairq3-6": Sequence(
         (
-            _pulse_block(_HI),
+            # _pulse_block(_HI),
             _cz_block(_SET5_ERR),
-            _pulse_block(_HI),
+            # _pulse_block(_HI),
+            _pulse_block(_XZ),
+            # _pulse_block(_HI),
+            _cz_block(_SET5_ERR),
+            # _pulse_block(_HI),
             _pulse_block(_YX),
-            _pulse_block(_HI),
-            _cz_block(_SET5_ERR),
-            _pulse_block(_HI),
-            _pulse_block(_XY),
         ),
-        construct_readout_rotation(LEVELS),
-        np.array([np.kron(SIGMA_Z, SIGMA_Z), _on(SIGMA_Z, 1)]),
+        None,
+        _Z_RESIDUAL,  # np.array([np.kron(SIGMA_Z, SIGMA_Z), _on(SIGMA_Z, 1)]),
     ),
 }
+
+
+PLAIN_LABEL = "qubit_pairq3-6"
 
 
 def sequence_for(label: str) -> Sequence:
     """The DD sequence the family `label` was taken with."""
     for key, sequence in SEQUENCES.items():
-        if key in label:
+        if key == label:
             return sequence
     # The plain (no-DD) node and the IBM CSVs both run set1's ZZ/ZI/IZ experiment.
     if label == "qubit_pairq3-6" or "ibm" in label:
@@ -619,9 +626,15 @@ def _compiled(label: str) -> _Compiled:
     )
 
 
-def construct_unit_op(label: str, eta, eps, kap, z1, z2, d1, d2, r1, r2) -> np.ndarray:
-    """Superoperator of one full repetition of `label`'s sequence."""
-    sequence = _compiled(label)
+def construct_unit_op(
+    label: str, eta, eps, kap, z1, z2, d1, d2, r1, r2, sequence: "_Compiled" = None
+) -> np.ndarray:
+    """Superoperator of one full repetition of `label`'s sequence.
+
+    `sequence` overrides the compiled form of `label`, so a caller can swap the
+    ideal DD pulses for imperfect ones (fim_check.py) without touching SEQUENCES.
+    """
+    sequence = _compiled(label) if sequence is None else sequence
     dissipator = _decay_super(d1, d2, r1, r2)
     # Every block dwells for one of two durations, and every CZ carries the same
     # coherent error, so three propagators cover the whole repetition.
@@ -726,6 +739,7 @@ def new_gate_fidelities(
     generator_basis: np.ndarray = _GENERATOR_BASIS,
     readout_basis: np.ndarray = None,
     label: str | None = None,
+    sequence: "_Compiled" = None,
 ):
     """Outcome probabilities from the DD sequence `label` was taken with.
 
@@ -737,7 +751,9 @@ def new_gate_fidelities(
         n = np.arange(n)
     n = np.asarray(n, dtype=float)
 
-    unit_op = construct_unit_op(label, eta, eps, kap, z1, z2, d1, d2, r1, r2)
+    unit_op = construct_unit_op(
+        label, eta, eps, kap, z1, z2, d1, d2, r1, r2, sequence=sequence
+    )
     rot = readout_basis_for(label)
 
     state = construct_init_state(rot, LEVELS).astype(complex)
@@ -1010,8 +1026,10 @@ def fit_family(
 def fixed_params_for(label: str) -> dict:
     if "set1" in label or label == "qubit_pairq3-6":
         return {"z1": 0.0, "z2": 0.0}
+    if "set2" in label or "set3" in label:
+        return {"z1": 0.0, "z2": 0.0}
     if ("set4" in label) or ("set5" in label):
-        return {"z2": 0.0}
+        return {"z1": 0.0, "z2": 0.0}
     return {}
 
 
@@ -1265,8 +1283,6 @@ def analyze_experiments(data_path: Path, seed: int, output_prefix: Path):
             }
         )
         for idx, family in enumerate(families):
-            if idx != 0:
-                continue
             family_rows, _ = process_single_family(family, rng)
             rows.extend(family_rows)
 
