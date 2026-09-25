@@ -43,7 +43,7 @@ SHOT_DIM_CANDIDATES = ("shot", "n", "N")
 _SET_VAR_RE = re.compile(r"^state_(control|target)_s(\d+)_(\d+)$")
 
 # Every coefficient of a term in the coherent-error Hamiltonian.
-PHASE_NAMES = ["eta", "eps", "kap", "z1", "z2"]
+PHASE_NAMES = ["eta", "eps", "kap", "z1", "z2", "z12"]
 
 
 ############
@@ -145,11 +145,11 @@ def process_ds_raw(ds: xr.Dataset) -> xr.Dataset:
 ############
 # Analysis functions
 ############
-# eta, eps, kap | d1, d2 | r1, r2 | ep1, em1, ep2, em2 | z1, z2
+# eta, eps, kap | d1, d2 | r1, r2 | ep1, em1, ep2, em2 | z1, z2, z12
 # Params: Coherent errors, sigma_z decay rate, sigma_- decay rate, readout + prep error
 # rates, un-refocused single-qubit Z residual.
-LOWER_BOUNDS = np.array([-0.3] * 3 + [0.0] * 4 + [0.0] * 4 + [-0.3] * 2)
-UPPER_BOUNDS = np.array([0.3] * 3 + [1.0] * 4 + [0.3] * 4 + [0.3] * 2)
+LOWER_BOUNDS = np.array([-0.3] * 3 + [0.0] * 4 + [0.0] * 4 + [-0.3] * 3)
+UPPER_BOUNDS = np.array([0.3] * 3 + [3.0] * 4 + [0.3] * 4 + [0.3] * 3)
 
 N_RESTARTS = 20
 GLS_PASSES = 2
@@ -264,7 +264,7 @@ def construct_init_values(
     Returns:
         np.ndarray: Array of initial parameter values (with fixed-value entries removed).
     """
-    # eta, eps, kap | d1, d2, r1, r2 | ep1, em1, ep2, em2 | z1, z2
+    # eta, eps, kap | d1, d2, r1, r2 | ep1, em1, ep2, em2 | z1, z2, z12
     t2, t1 = [11000, 21000], [10000, 30000]
     discard_idx = [i for i, name in enumerate(PARAM_NAMES) if name in fixed_params]
     if "set1" in family.label:
@@ -278,7 +278,8 @@ def construct_init_values(
         )
 
     elif (
-        ("set2" in family.label)
+        ("set0" in family.label)
+        or ("set2" in family.label)
         or ("set3" in family.label)
         or ("set4" in family.label)
         or ("set5" in family.label)
@@ -302,7 +303,7 @@ def construct_init_values(
         [
             params,
             rng.uniform(0, 0.1, size=4),
-            rng.uniform(-Z_INIT_SCALE, Z_INIT_SCALE, size=2),
+            rng.uniform(-Z_INIT_SCALE, Z_INIT_SCALE, size=3),
         ]
     )
     if discard_idx:
@@ -396,7 +397,7 @@ CZ_SUPER = np.kron(CZ, CZ.conj())
 READOUT_ROT = construct_readout_rotation(LEVELS)
 # Dissipators scaled by (d1, d2, r1, r2), in the units `_decay_init` produces.
 DECAY_BASIS = construct_decay_basis(LEVELS)
-SQ_GT, TQ_GT = 30, 60
+SQ_GT, TQ_GT, TQ_ID = 32, 60, 20
 
 # Number operators of the two subsystems, in units of the computational splitting
 # E2's third entry carries the anharmonicity: |2> sits at 2 - 0.05.
@@ -407,7 +408,7 @@ E2 = np.array([[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 2.0 - 0.05]], dtype=
 
 Z_INIT_SCALE = 0.2
 
-_Z_RESIDUAL = np.array([_on(SIGMA_Z, 0), _on(SIGMA_Z, 1)])
+_Z_RESIDUAL = np.array([_on(SIGMA_Z, 0), _on(SIGMA_Z, 1), np.kron(SIGMA_Z, SIGMA_Z)])
 
 
 # DD pulses, as 4x4 unitaries. `_super` turns one into the superoperator
@@ -479,6 +480,10 @@ def _cz_block(err_ops, ideal=_II):
     return (ideal, err_ops, TQ_GT)
 
 
+def _id_block():
+    return (np.eye(4), None, TQ_ID)
+
+
 def _pulse_block(u):
     return (u, None, SQ_GT)
 
@@ -500,31 +505,51 @@ SEQUENCES = {
     # H CZ H  X  H CZ H  X, with the ideal CZ kept (it commutes with the error).
     "qubit_pairq3-6": Sequence(
         (
+            _id_block(),
             _cz_block(_ZZ_ERR, ideal=CZ),
+            _id_block(),
+            _id_block(),
             _cz_block(_ZZ_ERR, ideal=CZ),
+            _id_block(),
+        ),
+        construct_readout_rotation(LEVELS),
+        _Z_RESIDUAL,
+    ),
+    "db_set0_qubit_pairq3-6": Sequence(
+        (
+            _id_block(),
+            _cz_block(_ZZ_ERR, ideal=CZ),
+            _id_block(),
+            _id_block(),
+            _cz_block(_ZZ_ERR, ideal=CZ),
+            _id_block(),
         ),
         construct_readout_rotation(LEVELS),
         _Z_RESIDUAL,
     ),
     "db_set1_qubit_pairq3-6": Sequence(
         (
-            _pulse_block(_HH),
+            _id_block(),
             _cz_block(_ZZ_ERR, ideal=CZ),
-            _pulse_block(_HH),
-            _pulse_block(_XI),
-            _pulse_block(_HH),
+            _id_block(),
+            _pulse_block(_ZI),
+            _id_block(),
             _cz_block(_ZZ_ERR, ideal=CZ),
-            _pulse_block(_HH),
-            _pulse_block(_IX),
+            _id_block(),
+            _pulse_block(_IZ),
         ),
-        None,
-        None,
+        construct_readout_rotation(LEVELS),
+        _Z_RESIDUAL,
     ),
     "db_set2_qubit_pairq3-6": Sequence(
         (
+            _id_block(),
             _cz_block(_YY_ERR),
+            _id_block(),
             _pulse_block(_YI),
+            _id_block(),
             _cz_block(_YY_ERR),
+            _id_block(),
             _pulse_block(_IY),
         ),
         None,
@@ -532,9 +557,13 @@ SEQUENCES = {
     ),
     "db_set3_qubit_pairq3-6": Sequence(
         (
+            _id_block(),
             _cz_block(_XX_ERR),
+            _id_block(),
             _pulse_block(_XI),
+            _id_block(),
             _cz_block(_XX_ERR),
+            _id_block(),
             _pulse_block(_IX),
         ),
         None,
@@ -542,13 +571,13 @@ SEQUENCES = {
     ),
     "db_set4_qubit_pairq3-6": Sequence(
         (
-            # _pulse_block(_IH),
+            _id_block(),
             _cz_block(_SET4_ERR),
-            # _pulse_block(_IH),
+            _id_block(),
             _pulse_block(_ZX),
-            # _pulse_block(_IH),
+            _id_block(),
             _cz_block(_SET4_ERR),
-            # _pulse_block(_IH),
+            _id_block(),
             _pulse_block(_XY),
         ),
         None,
@@ -556,13 +585,13 @@ SEQUENCES = {
     ),
     "db_set5_qubit_pairq3-6": Sequence(
         (
-            # _pulse_block(_HI),
+            _id_block(),
             _cz_block(_SET5_ERR),
-            # _pulse_block(_HI),
+            _id_block(),
             _pulse_block(_XZ),
-            # _pulse_block(_HI),
+            _id_block(),
             _cz_block(_SET5_ERR),
-            # _pulse_block(_HI),
+            _id_block(),
             _pulse_block(_YX),
         ),
         None,
@@ -605,7 +634,7 @@ class _Compiled(NamedTuple):
     steps: tuple  # (pulse superoperator, is_cz, dwell_ns)
     err_supers: tuple  # the (eta, eps, kap) Hamiltonian superoperators
     dwells: tuple  # the distinct dwell times, of which there are only two
-    residual_supers: tuple  # the (z1, z2) Hamiltonian superoperators, or ()
+    residual_supers: tuple  # the (z1, z2, z12) Hamiltonian superoperators, or ()
 
 
 @lru_cache(maxsize=None)
@@ -627,7 +656,18 @@ def _compiled(label: str) -> _Compiled:
 
 
 def construct_unit_op(
-    label: str, eta, eps, kap, z1, z2, d1, d2, r1, r2, sequence: "_Compiled" = None
+    label: str,
+    eta,
+    eps,
+    kap,
+    z1,
+    z2,
+    d1,
+    d2,
+    r1,
+    r2,
+    z12=0.0,
+    sequence: "_Compiled" = None,
 ) -> np.ndarray:
     """Superoperator of one full repetition of `label`'s sequence.
 
@@ -649,7 +689,9 @@ def construct_unit_op(
         "hamiltonian",
     )
     residual_gen = (
-        z1 * sequence.residual_supers[0] + z2 * sequence.residual_supers[1]
+        z1 * sequence.residual_supers[0]
+        + z2 * sequence.residual_supers[1]
+        + z12 * sequence.residual_supers[2]
         if sequence.residual_supers
         else None
     )
@@ -692,7 +734,7 @@ def effective_generator_basis(label: str) -> np.ndarray:
     # out 1/3 sigma^- and 2/3 sigma^+ and its true even split.
     sequence = sequence_for(label)
     blocks = sequence.blocks * 2
-    basis = np.zeros((9, DIM**2, DIM**2), dtype=complex)
+    basis = np.zeros((10, DIM**2, DIM**2), dtype=complex)
     frame = np.eye(DIM**2, dtype=complex)
     for pulse, err_ops, dwell in blocks:
         frame = _super(pulse) @ frame
@@ -736,6 +778,7 @@ def new_gate_fidelities(
     em2,
     z1,
     z2,
+    z12=0.0,
     generator_basis: np.ndarray = _GENERATOR_BASIS,
     readout_basis: np.ndarray = None,
     label: str | None = None,
@@ -752,7 +795,7 @@ def new_gate_fidelities(
     n = np.asarray(n, dtype=float)
 
     unit_op = construct_unit_op(
-        label, eta, eps, kap, z1, z2, d1, d2, r1, r2, sequence=sequence
+        label, eta, eps, kap, z1, z2, d1, d2, r1, r2, z12, sequence=sequence
     )
     rot = readout_basis_for(label)
 
@@ -893,15 +936,15 @@ def construct_x_trial(
 ):
     """
     Construct a trial parameter vector `x0_trial` for optimization, supporting random
-    initialization and jittered restarts, while respecting any fixed parameters.
+    initialization and fresh random restarts, while respecting any fixed parameters.
 
     Args:
         x0 (np.ndarray | None): The initial parameter guess. If None, a random starting point
-                                is generated; otherwise, this is the base for (potentially
-                                jittered) restarts.
+                                is generated; otherwise, this is the starting point for
+                                the first attempt; later attempts ignore it.
         attempt (int): The index of the current restart.
                        - 0 indicates the primary attempt (no perturbation).
-                       - >0 indicates a random restart with jitter.
+                       - >0 indicates a fresh random draw.
         rng (np.random.Generator).
         fixed_params (dict | None): Dictionary specifying the names and values of parameters fixed
                                     during this fit. These parameters are omitted from the trial vector.
@@ -911,34 +954,24 @@ def construct_x_trial(
     Returns:
         np.ndarray: A parameter vector suitable for passing to the solver.
     """
-    # eta, eps, kap | d1, d2, r1, r2 | ep1, em1, ep2, em2 | z1, z2
+    # eta, eps, kap | d1, d2, r1, r2 | ep1, em1, ep2, em2 | z1, z2, z12
     discard_idx = [i for i, name in enumerate(PARAM_NAMES) if name in fixed_params]
     # d and r are rates in 1/us in both methods, so one set of scales covers both.
-    if x0 is None:
+    # Restarts draw a fresh random point rather than jittering x0, so they search
+    # beyond the basin x0 already sits in.
+    if x0 is None or attempt > 0:
         x0_trial = np.concatenate(
             [
                 rng.uniform(-0.02, 0.02, size=3),
                 rng.uniform(0.0, 1 / 100, size=4),
                 rng.uniform(0.0, 0.2, size=4),
-                rng.uniform(-Z_INIT_SCALE, Z_INIT_SCALE, size=2),
+                rng.uniform(-Z_INIT_SCALE, Z_INIT_SCALE, size=3),
             ]
         )
         if discard_idx:
             x0_trial = np.delete(x0_trial, discard_idx)
-    elif attempt == 0:
-        x0_trial = np.asarray(x0, dtype=float)
     else:
-        perturb = np.concatenate(
-            [
-                rng.uniform(-0.01, 0.01, size=3),
-                rng.uniform(0, 0.01, size=4),
-                rng.uniform(0, 0.001, size=4),
-                rng.uniform(-Z_INIT_SCALE, Z_INIT_SCALE, size=2),
-            ]
-        )
-        if discard_idx:
-            perturb = np.delete(perturb, discard_idx)
-        x0_trial = np.asarray(x0, dtype=float) + perturb
+        x0_trial = np.asarray(x0, dtype=float)
     return np.clip(x0_trial, lower_bounds, upper_bounds)
 
 
@@ -959,7 +992,7 @@ def fit_family(
     """Multi-start least-squares fit of all four curves at once, on a fixed budget.
 
     `x0` is the starting point for the first attempt; the remaining `n_restarts`
-    attempts are jittered around it. The lowest-cost attempt is then GLS-refined.
+    attempts start from fresh random draws. The lowest-cost attempt is then GLS-refined.
     """
     best = None
     for attempt in range(n_restarts + 1):
@@ -1024,12 +1057,27 @@ def fit_family(
 
 
 def fixed_params_for(label: str) -> dict:
+    # return {
+    #     "z1": 0.0,
+    #     "z2": 0.0,
+    #     "em1": 0.0,
+    #     "em2": 0.0,
+    #     "ep1": 0.0,
+    #     "ep2": 0.0,
+    #     # Decay fixed to the synthetic data's true values (scale.TRUE_PARAMS).
+    #     "d1": 0.04568,
+    #     "d2": 0.04218,
+    #     "r1": 0.029955,
+    #     "r2": 0.032101,
+    # }
+    if "set0" in label:
+        return {"z1": 0.0, "z2": 0.0, "z12": 0.0}
     if "set1" in label or label == "qubit_pairq3-6":
-        return {"z1": 0.0, "z2": 0.0}
-    if "set2" in label or "set3" in label:
-        return {"z1": 0.0, "z2": 0.0}
+        return {"z1": 0.0, "z2": 0.0, "z12": 0.0}
+    # if "set2" in label or "set3" in label:
+    # return {"z1": 0.0, "z2": 0.0}
     if ("set4" in label) or ("set5" in label):
-        return {"z1": 0.0, "z2": 0.0}
+        return {"z1": 0.0, "z2": 0.0, "z12": 0.0}
     return {}
 
 
@@ -1236,6 +1284,58 @@ def plot_family(
     plt.close(fig)
 
 
+LABELS = {
+    "db_set0_qubit_pairq3-6": {
+        "eta": "ZZ",
+        "eps": "ZI",
+        "kap": "IZ",
+        "z1": "ZI",
+        "z2": "IZ",
+        "z12": "ZZ",
+    },
+    "db_set1_qubit_pairq3-6": {
+        "eta": "ZZ",
+        "eps": "ZI",
+        "kap": "IZ",
+        "z1": "ZI",
+        "z2": "IZ",
+        "z12": "ZZ",
+    },
+    "db_set2_qubit_pairq3-6": {
+        "eta": "YY",
+        "eps": "YI",
+        "kap": "IY",
+        "z1": "ZI",
+        "z2": "IZ",
+        "z12": "ZZ",
+    },
+    "db_set3_qubit_pairq3-6": {
+        "eta": "XX",
+        "eps": "XI",
+        "kap": "IX",
+        "z1": "ZI",
+        "z2": "IZ",
+        "z12": "ZZ",
+    },
+    "db_set4_qubit_pairq3-6": {
+        "eta": "ZX",
+        "eps": "XY",
+        "kap": "YZ",
+        "z1": "ZI",
+        "z2": "IZ",
+        "z12": "ZZ",
+    },
+    "db_set5_qubit_pairq3-6": {
+        "eta": "XZ",
+        "eps": "YX",
+        "kap": "ZY",
+        "z1": "ZI",
+        "z2": "IZ",
+        "z12": "ZZ",
+    },
+}
+
+
 def analyze_experiments(data_path: Path, seed: int, output_prefix: Path):
     if not data_path.exists():
         raise FileNotFoundError(
@@ -1304,7 +1404,7 @@ def analyze_experiments(data_path: Path, seed: int, output_prefix: Path):
                 f"  -> {', '.join(f'{k}={final[k]:+.5f}' for k in PARAM_NAMES if k in final)}\n"
                 f"  -> fixed: {', '.join(f'{k}={v:+.5f}' for k, v in fixed_params.items())}\n"
                 f"  -> cost={final['true_cost']:.1f}\n"
-                f"  -> {', '.join(f'{k}={final[k]/2/np.pi/TQ_GT*1e6:+.5f}' for k in PHASE_NAMES if k in final)}\n"
+                f"  -> {', '.join(f'{LABELS[family.label][k]}={final[k]/2/np.pi/TQ_GT*1e6:+.5f}' for k in PHASE_NAMES if k in final)}\n"
                 f"  -> t1: {t1}, t2: {t2}\n"
                 f"reduced_chi2={final['reduced_chi2']:.2f} rmse={final['rmse']:.4f}\n"
             )
