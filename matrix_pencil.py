@@ -93,8 +93,6 @@ def matrix_pencil(data, N, L=None, error_floor=None):
     # A = U_N^H Ghat^1_f V_N S_N^{-1}, the restriction of
     # Ghat^1_f (Ghat^0)^+ to the signal subspace.
     A = U_N.conj().T @ G1_f @ V_N / s_N[None, :]
-    _, M = np.linalg.eig(A)
-    print("Condition number", np.linalg.cond(M))
     eigenvalues = np.linalg.eigvals(A)
 
     weights, residuals = _fit_weights(data, eigenvalues)
