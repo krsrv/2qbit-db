@@ -173,12 +173,7 @@ def infer_shots(ds: xr.Dataset, default: int = 1000) -> int:
 
 
 def prepare_dataset(ds_raw: xr.Dataset) -> xr.Dataset:
-    """Recompute P_ss from per-shot streams where they exist, else keep the stored ones.
-
-    `process_ds_raw` expects the general-protocol layout (state_control_s{set}_{pair}).
-    The plain DB node stores a single un-suffixed pair of streams instead, which it
-    rejects; that dataset already carries P_ss / P_ss_err, so fall through to those.
-    """
+    """Recompute P_ss from the per-shot streams, else keep the stored P_ss."""
     try:
         return process_ds_raw(ds_raw)
     except RuntimeError as exc:
@@ -192,11 +187,7 @@ def prepare_dataset(ds_raw: xr.Dataset) -> xr.Dataset:
 
 
 def iter_families(ds: xr.Dataset) -> list[Family]:
-    """Split `ds` into one Family per (db_set, qubit_pair, ...) combination.
-
-    Every dimension of P_00 other than the time axis indexes an independent experiment,
-    so the families are the points of their cross product.
-    """
+    """One Family per point of P_00's non-time dimensions (db_set, qubit_pair, ...)."""
     shots = infer_shots(ds)
     n = np.asarray(ds["number_of_operations"].values, dtype=float)
     family_dims = [d for d in ds[DATA_COLUMNS[0]].dims if d != "number_of_operations"]
@@ -217,10 +208,9 @@ def iter_families(ds: xr.Dataset) -> list[Family]:
 
 
 def construct_init_values(entry: DbSet, rng: np.random.Generator) -> np.ndarray:
-    """The fit's first starting point for `entry`, over its free parameters.
+    """First starting point over `entry`'s free parameters.
 
-    Draws every parameter in PARAM_NAMES order, fixed ones included, then drops the
-    fixed ones, so the random stream is the same whatever is fixed.
+    Fixed parameters are drawn too, then dropped, so the random stream does not change.
     """
     values = {}
     for name in PARAM_NAMES:
@@ -242,7 +232,7 @@ def get_decay_timescale(d1, d2, r1, r2, label: str) -> np.ndarray:
 # Fitting
 ############
 def _free_names(entry: DbSet) -> list[str]:
-    """The parameters `entry` fits, in PARAM_NAMES order: the layout of every x vector."""
+    """The parameters `entry` fits, in PARAM_NAMES order: the layout of x."""
     return [name for name in PARAM_NAMES if name not in entry.fixed]
 
 
@@ -269,21 +259,10 @@ def _residuals(
     shots: int,
     weight_probs: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Whitened residual vector for `least_squares`.
+    """Whitened residuals sqrt(shots) * (model - data) / sqrt(p).
 
-    Each row of `data` is one estimate of the four outcome probabilities from `shots`
-    shots, so its covariance is cov = (diag(p) - p p.T) / shots, which has rank 3 rather
-    than 4. Inverse of the 3x3 block gives cov^-1 = shots * (diag(1/q) + 1 1.T / q4)
-    with q4 = 1 - sum(q) the dropped outcome. Since the four residuals sum to zero,
-    the quadratic form r.T cov^-1 r becomes shots * sum_i r_i^2 / p_i over all four
-    outcomes. So the whitened residual is just sqrt(shots) * r / sqrt(p).
-
-    The vector has 4 entries per time step but still only 3 independent
-    ones, so the degrees of freedom are 3 * len(n) - len(x).
-
-    weight_probs: probabilities defining the covariance, shape (len(n), 4). None means
-        "use the model prediction at `x`", so the weights track the current estimate.
-        Pass an array to hold them fixed, as the iterated GLS passes do.
+    This is the multinomial chi^2, since each row's residuals sum to zero.
+    `weight_probs` fixes p (GLS passes); None uses the model prediction.
     """
     model_data = probabilities(entry, _params(entry, x), n).real
     probs = model_data if weight_probs is None else weight_probs
@@ -313,11 +292,7 @@ def _run_least_squares(
 
 
 def _gls_refine(result, entry: DbSet, n: np.ndarray, data: np.ndarray, shots: int):
-    """Iterated GLS: refit with the weights frozen at the current model prediction.
-
-    Holding the weights fixed within a pass keeps the solver from differentiating through them,
-    so the fixed point solves the unbiased estimating equation.
-    """
+    """Iterated GLS: refit with weights frozen at the current prediction."""
     for _ in range(GLS_PASSES):
         weight_probs = probabilities(entry, _params(entry, result.x), n).real
         refined = _run_least_squares(result.x, entry, n, data, shots, weight_probs)
@@ -331,11 +306,9 @@ def _gls_refine(result, entry: DbSet, n: np.ndarray, data: np.ndarray, shots: in
 def construct_x_trial(
     entry: DbSet, x0: np.ndarray | None, attempt: int, rng: np.random.Generator
 ) -> np.ndarray:
-    """The starting point of restart `attempt`, clipped to `entry`'s bounds.
+    """Start of restart `attempt`: `x0` for attempt 0, else a fresh draw.
 
-    Attempt 0 starts from `x0` (a random draw if it is None); every later attempt
-    draws a fresh random point, so restarts search beyond the basin x0 already sits in.
-    Every parameter is drawn, fixed ones included, then the fixed ones are dropped.
+    Fixed parameters are drawn too, then dropped.
     """
     if x0 is None or attempt > 0:
         draws = {p.name: rng.uniform(*p.restart) for p in PARAMS}
@@ -354,14 +327,10 @@ def fit_family(
     x0: np.ndarray | None = None,
     n_restarts: int = N_RESTARTS,
 ) -> dict:
-    """Multi-start least-squares fit of all four curves at once, on a fixed budget.
+    """Multi-start fit of all four curves; the best attempt is then GLS-refined.
 
-    `x0` (over `entry`'s free parameters) is the starting point for the first attempt;
-    the remaining `n_restarts` attempts start from fresh random draws. The lowest-cost
-    attempt is then GLS-refined.
-
-    Returns the fitted free parameters by name, plus true_cost, rmse, reduced_chi2,
-    at_bound and the scipy `result`.
+    Returns the free parameters by name plus true_cost, rmse, reduced_chi2,
+    at_bound and result.
     """
     best = None
     for attempt in range(n_restarts + 1):
@@ -374,7 +343,7 @@ def fit_family(
 
     params = dict(zip(_free_names(entry), best.x))
     params["true_cost"] = 0.5 * np.sum(_residuals(best.x, entry, n, data, shots) ** 2)
-    # 4 residual entries per time step but only 3 independent ones (the rows sum to 1).
+    # Rows sum to 1: 3 independent residuals per time step.
     dof = 3 * len(n) - len(best.x)
     params["rmse"] = float(np.sqrt(2 * params["true_cost"] / dof))
     params["reduced_chi2"] = float(2 * params["true_cost"] / dof)
@@ -390,23 +359,10 @@ def fit_family(
 
 
 def _phase_flip_is_a_symmetry(entry: DbSet, family: Family, params: dict) -> bool:
-    """Whether negating every phase leaves this family's model curve unchanged.
+    """Whether negating every free phase moves the curve by under one standard error.
 
-    `_canonicalize` picks the positive branch of a phases -> -phases degeneracy.
-    Which sign flips are degeneracies depends on the set: set1 is blind to the global
-    flip, and sets 4 and 5 are blind to it but not to flipping eps or kap on their
-    own. Sets 2 and 3 are blind to it only when z1 and z2 flip along with the error
-    triple: the residual does not commute with the triple, so their relative sign is
-    physical and negating either group alone moves the curve by ~1e-1. Flip one that
-    is not a degeneracy and the row written to the CSV stops reproducing the fit it
-    came from -- and `plot_family`, which draws that row, plots a curve that misses
-    the data. Rather than tabulate which sets qualify, ask the model.
-
-    "Degenerate" here means the two curves differ by less than the standard error of
-    a single measured probability, since a difference smaller than that is not what
-    the fit resolved: the DD sequences break the global flip in sets 4 and 5 at the
-    1e-3 level through terms that do not commute with the dissipator, which is real
-    but three times under the noise floor at 5000 shots.
+    Which flips are degeneracies depends on the set, so ask the model rather than
+    tabulate; flipping a non-degenerate branch would write a row that misses the data.
     """
     point = {**entry.fixed, **{name: params[name] for name in _free_names(entry)}}
     flipped = {
@@ -420,14 +376,9 @@ def _phase_flip_is_a_symmetry(entry: DbSet, family: Family, params: dict) -> boo
 
 
 def _canonicalize(fit_params: dict, entry: DbSet, family: Family) -> dict:
-    """Pick the positive branch of the phase flip, only where the flip is a degeneracy.
+    """Flip so the largest free phase is positive, when that flip is a degeneracy.
 
-    Reading the branch off eps works while eps is clearly non-zero, but these fits
-    routinely drive eps and kap to ~1e-8, and then the branch is decided by rounding
-    noise -- two runs of the same data land on eta = +0.0049 and eta = -0.0049 and
-    look like they disagree when they are the same point. Read the branch off the
-    phase with the most magnitude behind it instead; for a fit where eps dominates
-    this is the same rule.
+    Reading the branch off eps alone fails when eps fits to ~1e-8.
     """
     free_phases = {
         name: value
@@ -448,13 +399,9 @@ def _canonicalize(fit_params: dict, entry: DbSet, family: Family) -> dict:
 
 
 def process_single_family(family: Family, rng) -> list[dict]:
-    """Given data for a single family, run the fitting procedure. Use init_values
-    as the initial guess.
+    """Fit `family` on each prefix of its time steps, warm-chaining the solutions.
 
-    Fits a growing prefix of the time steps and warm-chains each solution into the
-    next, so the expensive search happens once on the shortest prefix and every later
-    fit is a local refinement of it. Returns one record per prefix; the last record is
-    the fit over all the data.
+    Returns one row per prefix (the last covers all the data) and the final fit.
     """
     max_reps = len(family.n)
     prefixes = [
@@ -500,11 +447,7 @@ def process_single_family(family: Family, rng) -> list[dict]:
 
 
 def plot_family(family: Family, entry: DbSet, params: dict, pdf: PdfPages) -> None:
-    """Measured probabilities against the fitted model, one panel per joint state.
-
-    `params` is the full {name: value} point. Appends one page to `pdf` so every
-    family ends up in a single vector document.
-    """
+    """Append a page of data vs. fit to `pdf`; `params` is the full parameter point."""
     dense_n = np.linspace(float(np.min(family.n)), float(np.max(family.n)), PLOT_POINTS)
     model = probabilities(entry, params, dense_n).real
     fig, axes = plt.subplots(1, 4, figsize=(16, 3.4), sharex=True, sharey=True)
@@ -565,7 +508,7 @@ def analyze_experiments(data_path: Path, seed: int, output_prefix: Path):
             if "shots" in df.columns and len(df["shots"]) > 0
             else 800
         )
-        # Try to gather all families (we only support single family here)
+        # A CSV holds a single family.
         data = np.stack([df[c].values for c in ["00", "01", "10", "11"]], axis=-1)
         family = Family("ibm_" + data_path.name, {}, n, data, None, shots)
         families = [family]
@@ -574,7 +517,7 @@ def analyze_experiments(data_path: Path, seed: int, output_prefix: Path):
 
     rng = np.random.default_rng(seed)
 
-    # Create the output_dir as the parent directory of output_prefix, and a pdf path at output_prefix with ".pdf" extension
+    # Writes output_prefix.pdf and output_prefix.csv.
     output_dir = output_prefix.parent
     output_dir.mkdir(parents=True, exist_ok=True)
     pdf_path = output_prefix.with_suffix(".pdf")

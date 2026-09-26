@@ -1,20 +1,13 @@
-"""Two-qubit DB model: parameters, db_set definitions and outcome probabilities.
+"""Two-qubit DB model.
 
-Interface:
-    PARAMS, PARAM_NAMES, PHASE_NAMES -- the fit parameters, in the one order every
-        array of them uses.
-    DbSet, DB_SETS -- one entry per experiment: its pulse sequence, readout basis,
-        Pauli names, fixed parameters, bounds and initial values.
-    MODEL -- which model `probabilities` uses: "mix" (first-order toggling-frame
-        average of the sequence) or "model_dd" (the sequence gate by gate).
-    probabilities(entry, params, n) -- P(00), P(01), P(10), P(11) after n repetitions.
-    construct_unit_op(entry, params) -- superoperator of one repetition ("model_dd").
+PARAMS, PARAM_NAMES, PHASE_NAMES: the fit parameters, in array order.
+DB_SETS: one DbSet per experiment.
+MODEL: "mix" (toggling-frame average) or "model_dd" (gate by gate).
+probabilities(entry, params, n): outcome probabilities; `params` is a name->value dict.
+construct_unit_op(entry, params): superoperator of one repetition.
 
-`params` is always a {name: value} dict over PARAM_NAMES.
-
-eta, eps, kap are the coefficients of the db_set's Pauli error triple (ZZ, ZI, IZ for
-set1); d1, d2, r1, r2 the dephasing and relaxation rates; ep1, em1, ep2, em2 the readout
-confusion; z1, z2, z12 the un-refocused ZI, IZ, ZZ residual.
+eta, eps, kap: the set's error triple; d, r: dephasing, relaxation; ep, em: readout
+confusion; z1, z2, z12: un-refocused ZI, IZ, ZZ.
 """
 
 from __future__ import annotations
@@ -58,17 +51,16 @@ PARAMS = (
     Param("z12", "residual", (-Z_INIT_SCALE, Z_INIT_SCALE)),
 )
 PARAM_NAMES = [p.name for p in PARAMS]
-# Every coefficient of a term in the coherent-error Hamiltonian.
+# Coherent-error coefficients.
 PHASE_NAMES = [p.name for p in PARAMS if p.group in ("phase", "residual")]
-# The generator is linear in every non-SPAM parameter; this is the order of its basis.
+# Order of the generator basis: every non-SPAM parameter.
 _GENERATOR_NAMES = [p.name for p in PARAMS if p.group != "spam"]
 _SLOTS = {
     group: [_GENERATOR_NAMES.index(p.name) for p in PARAMS if p.group == group]
     for group in ("phase", "decay", "residual")
 }
 
-# Probabilities below this are treated as this value when they set the weights, so a
-# model prediction that runs to zero cannot produce an infinite weight.
+# Floor on probabilities used as fit weights.
 MIN_WEIGHT_PROB = 1e-12
 
 
@@ -102,12 +94,7 @@ def _dissipator_super(c: np.ndarray) -> np.ndarray:
 
 
 def _super(u: np.ndarray) -> np.ndarray:
-    """Superoperator of rho -> u rho u^dag.
-
-    Building a pulse this way (rather than kron(U, U) by hand) keeps the conjugate on
-    the imaginary Pauli-Y pulses, whose sign would otherwise only cancel by accident
-    because each appears an even number of times per half-repetition.
-    """
+    """Superoperator of rho -> u rho u^dag (keeps the conjugate on Y pulses)."""
     return np.kron(u, u.conj())
 
 
@@ -119,18 +106,12 @@ QUBIT_LEVELS = (2, 2)
 LEVELS = QUBIT_LEVELS
 DIM = np.prod(LEVELS)
 
-# Readout bins every leakage level with this computational level: a transmon
-# discriminator lands |2> in the |1> window far more often than the |0> one.
+# Readout reports a leakage level as this computational level.
 LEAK_READOUT_LEVEL = 1
 
 
 def _number(d: int) -> np.ndarray:
-    """Number operator diag(0, 1, ..., d-1).
-
-    Its dissipator dephases the 0-1 coherence at exactly the rate 0.5 * Z did (a
-    dissipator only sees *differences* of a diagonal jump operator, and both have
-    c_0 - c_1 = 1), and a leakage level dephases at the usual level-squared rate.
-    """
+    """diag(0, 1, ..., d-1); dephases 0-1 at the same rate as 0.5 * Z."""
     return np.diag(np.arange(d, dtype=float))
 
 
@@ -155,11 +136,7 @@ def construct_decay_basis(levels: tuple[int, int] = QUBIT_LEVELS) -> np.ndarray:
 
 
 def construct_cz(levels: tuple[int, int] = QUBIT_LEVELS) -> np.ndarray:
-    """CZ on the computational block, identity on every leakage level.
-
-    The conditional phase the *ideal* gate applies is the one on |11>; whatever phase
-    the real pulse leaves on |02> belongs in the coherent-error Hamiltonian.
-    """
+    """CZ on the computational block, identity on leakage levels."""
     la, lb = levels
     diag = np.ones(la * lb)
     diag[lb + 1] = -1.0  # |11>
@@ -168,11 +145,7 @@ def construct_cz(levels: tuple[int, int] = QUBIT_LEVELS) -> np.ndarray:
 
 
 def construct_readout_rotation(levels: tuple[int, int] = QUBIT_LEVELS) -> np.ndarray:
-    """Basis-change for an X-basis readout, one Hadamard per subsystem.
-
-    The pre-measurement pulse only drives the computational transition, so it acts as
-    the identity on a leakage level.
-    """
+    """X-basis readout: a Hadamard on each qubit's computational levels."""
     mats = []
     for d in levels:
         m = np.eye(d)
@@ -189,13 +162,7 @@ def _readout_bin(level: int) -> int:
 def construct_ideal_msmt_ops(
     rot: np.ndarray = None, levels: tuple[int, int] = QUBIT_LEVELS
 ) -> np.ndarray:
-    """The four ideal outcome operators, rotated into the measured basis by `rot`.
-
-    `rot = construct_readout_rotation(levels)` gives the X basis, `rot = None` (the
-    default) the Z basis.
-
-    A leakage level is counted in the outcome named by LEAK_READOUT_LEVEL.
-    """
+    """The four ideal outcome operators in the basis `rot` (None: Z basis)."""
     la, lb = levels
     dim = la * lb
     ops = np.zeros((4, dim, dim), dtype=complex)
@@ -223,20 +190,14 @@ def construct_init_state(
 def construct_msmt_op(
     ep1, em1, ep2, em2, rot: np.ndarray = None, levels: tuple[int, int] = QUBIT_LEVELS
 ):
-    """Outcome operators with the 4x4 readout confusion matrix folded in.
-
-    The confusion matrix stays 4x4 because it acts on the reported outcomes, which
-    `construct_ideal_msmt_ops` has already binned down to four.
-    """
+    """Outcome operators with the 4x4 readout confusion matrix folded in."""
     a = np.array([[1 - ep1, em1], [ep1, 1 - em1]])
     b = np.array([[1 - ep2, em2], [ep2, 1 - em2]])
     confusion = (a[:, None, :, None] * b[None, :, None, :]).reshape(4, 4)
     return confusion @ construct_ideal_msmt_ops(rot, levels)
 
 
-# The lab-frame generator basis of the "synthetic" db_set, in _GENERATOR_NAMES order:
-# the Hamiltonian terms carry one phase each, and each jump operator is a fixed matrix
-# scaled by its rate. The generator is then a single (256, 10) @ (10,) product.
+# Lab-frame generator basis of the "synthetic" entry, in _GENERATOR_NAMES order.
 _GENERATOR_BASIS = np.array(
     [
         _hamiltonian_super(np.kron(SIGMA_Z, SIGMA_Z)),  # eta
@@ -257,8 +218,7 @@ _GENERATOR_BASIS = np.array(
 ############
 # Propagators
 ############
-# cond(V) past which an `eig` basis is too ill-conditioned to exponentiate through,
-# so `evolve` falls back to scaling-and-squaring instead.
+# Above this cond(V), `evolve` falls back to expm.
 _MAX_EIGENBASIS_COND = 1e8
 
 
@@ -266,24 +226,13 @@ _MAX_EIGENBASIS_COND = 1e8
 def _eigendecompose(
     key: bytes, dim: int, kind: str
 ) -> tuple[np.ndarray, np.ndarray, str]:
-    """Eigendecomposition of the (dim, dim) complex matrix whose buffer is `key`.
+    """Cached eigendecomposition of the matrix whose bytes are `key`.
 
-    Returns (eigenvalues, eigenvectors, mode), where mode tells `evolve` how to
-    reassemble the propagator: "unitary" if the eigenbasis is orthonormal, "solve" if
-    it has to be inverted, "expm" if it is too ill-conditioned to use at all (then the
-    first two entries are None).
-
-    `kind` is what the caller already knows about the matrix: "hamiltonian" for the
-    anti-Hermitian generator of a coherent rotation, "dissipator" for one that is
-    neither, "unknown" to work it out.
-
-    Keyed on the raw bytes so that repeated calls with the *same* Liouvillian at
-    different times share one decomposition; the arrays are handed out read-only
-    because every caller gets the same objects back.
+    Returns (eigenvalues, eigenvectors, mode) with mode "unitary", "solve" or "expm"
+    (too ill-conditioned; arrays None). `kind`: "hamiltonian", "dissipator", "unknown".
     """
     L = np.frombuffer(key, dtype=complex).reshape(dim, dim)
-    # Use `eigh` on Hermitian and anti-Hermitian superoperators to avoid singularities
-    # in calculating eigenvalues.
+    # eigh for (anti-)Hermitian matrices.
     anti_hermitian = kind == "hamiltonian" or (
         kind == "unknown" and np.allclose(L, -L.conj().T)
     )
@@ -296,8 +245,7 @@ def _eigendecompose(
     else:
         # Usually for the dissipator.
         eigenvalues, eigenvectors = np.linalg.eig(L)
-        # 1-norm rather than the default 2-norm: it is an LU rather than an SVD, and
-        # the two agree to within a factor of dim, which decides nothing at 1e8.
+        # 1-norm cond: an LU rather than an SVD.
         if np.linalg.cond(eigenvectors, 1) > _MAX_EIGENBASIS_COND:
             return None, None, "expm"
         mode = "solve"
@@ -307,14 +255,8 @@ def _eigendecompose(
 
 
 def evolve(L: np.ndarray, t: float, kind: str = "unknown"):
-    """Given a time-constant Louivillian in superoperator form (d^2 x d^2), get the propogator for
-    corresponding to time t"""
-    # exp(L t) = V diag(exp(w t)) V^-1
-    # Scale the columns of V by exp(w t) and solve against V.T rather than forming
-    # V^-1. Same trick as `probabilities`.
-    #
-    # It also amortizes across calls: `construct_unit_op` evolves one dissipator at
-    # both of the sequence's dwell times, and the cache turns those into a single eig.
+    """Propagator exp(L t) of the constant Liouvillian `L`."""
+    # exp(L t) = V diag(exp(w t)) V^-1, solving against V rather than inverting it.
     L = np.ascontiguousarray(L, dtype=complex)
     eigenvalues, eigenvectors, mode = _eigendecompose(L.tobytes(), L.shape[0], kind)
     if mode == "expm":
@@ -328,7 +270,7 @@ def evolve(L: np.ndarray, t: float, kind: str = "unknown"):
 CZ = construct_cz(LEVELS)
 # vec form of rho -> CZ rho CZ^dag, i.e. kron(CZ, CZ.conj()).
 CZ_SUPER = np.kron(CZ, CZ.conj())
-# Dissipators scaled by (d1, d2, r1, r2), in the units `_decay_init` produces.
+# Dissipators scaled by (d1, d2, r1, r2).
 DECAY_BASIS = construct_decay_basis(LEVELS)
 SQ_GT, TQ_GT, TQ_ID = 32, 60, 20
 
@@ -410,11 +352,7 @@ def _pulse_block(u):
 # db_sets
 ############
 class _Compiled(NamedTuple):
-    """A sequence with everything independent of the fit parameters worked out.
-
-    `construct_unit_op` runs on every residual and every finite-difference column of
-    every restart, so it should not be rebuilding the same fixed matrices each time.
-    """
+    """A sequence with its parameter-independent matrices precomputed."""
 
     steps: tuple  # (pulse superoperator, is_cz, dwell_ns)
     err_supers: tuple  # the (eta, eps, kap) Hamiltonian superoperators
@@ -424,26 +362,18 @@ class _Compiled(NamedTuple):
 
 @dataclass(frozen=True, eq=False)
 class DbSet:
-    """One experiment: how it is played, read out, labelled and fit.
+    """One experiment.
 
-    blocks: one half repetition of the DD sequence, in time order, as
-        (pulse 4x4, err_ops or None, dwell_ns). `pulse` is the ideal gate of the
-        block; `err_ops` the (eta, eps, kap) Pauli triple a CZ block's coherent error
-        is written in, or None for a single-qubit pulse (taken to be error free);
-        `dwell_ns` how long the dissipator acts for. None for an entry defined by its
-        generator basis alone.
-    generator_basis: the "mix" generator basis, in _GENERATOR_NAMES order. None means
-        derive it from `blocks` (`mix_basis`).
+    blocks: half a repetition in time order, as (pulse, err_ops, dwell_ns); err_ops is
+        a CZ block's (eta, eps, kap) Pauli triple, None for an error-free pulse.
+    generator_basis: explicit "mix" basis; None derives it from `blocks`.
     readout_rot: pre-measurement rotation, None for the Z basis.
-    residual_ops: the (z1, z2, z12) residual operators, or None.
+    residual_ops: the (z1, z2, z12) operators.
     pauli_labels: the Pauli term each phase parameter multiplies.
-    fixed: parameters held at a value during the fit.
-    lower, upper: fit bounds for every parameter.
-    init: the fit's first starting point, per parameter: ("uniform", low, high) is drawn,
-        ("value", v) is taken as is. Every parameter is drawn (in PARAM_NAMES order)
-        even when fixed, so the random stream does not depend on what is fixed.
+    fixed, lower, upper: fixed values and fit bounds.
+    init: first starting point, ("uniform", low, high) or ("value", v) per parameter.
 
-    Hashed by identity, so `dataclasses.replace` gives an entry with its own caches.
+    Hashed by identity, so a `dataclasses.replace` copy gets its own caches.
     """
 
     name: str
@@ -479,26 +409,15 @@ class DbSet:
 
     @cached_property
     def mix_basis(self) -> np.ndarray:
-        """The "mix" generator basis: `generator_basis`, or the sequence's average.
-
-        The "mix" model has no DD pulses: it exponentiates one 16x16 generator for
-        `4 * n`, four gates per repetition. We want that generator to approximate
-        `construct_unit_op`, the simplest version of which is the first-order Magnus
-        (toggling-frame) average. Each block's contribution is conjugated by the
-        pulses played before it, weighted by how long the block lasts:
+        """`generator_basis`, or the sequence's first-order toggling-frame average
 
             G_eff = (1 / 4) sum_j W_j^dag (L_err_j + dwell_j L_diss) W_j,
 
-        where W_j is the cumulative pulse superoperator through block j. For the
-        coherent part it just reproduces the surviving Pauli triple in the frame the
-        pulses leave it in. Relaxation operators get symmetrized to some extent.
+        with W_j the pulses played through block j.
         """
         if self.generator_basis is not None:
             return self.generator_basis
-        # The whole repetition, not one half doubled: the pulses of the first half do
-        # not compose back to the identity, so the second half runs in a frame the
-        # first half left rotated. For set2 that is the difference between relaxation
-        # coming out 1/3 sigma^- and 2/3 sigma^+ and its true even split.
+        # Both halves: the first leaves the frame rotated.
         basis = np.zeros((len(_GENERATOR_NAMES), DIM**2, DIM**2), dtype=complex)
         frame = np.eye(DIM**2, dtype=complex)
         for pulse, err_ops, dwell in self.blocks * 2:
@@ -511,20 +430,14 @@ class DbSet:
             if self.residual_ops is not None:
                 for slot, op in zip(_SLOTS["residual"], self.residual_ops):
                     basis[slot] += _hamiltonian_super(op)
-        # `probabilities` exponentiates for 4 * n, four gates per repetition.
+        # Four gates per repetition.
         basis /= 4
-        # Every caller shares the cached array.
         basis.flags.writeable = False
         return basis
 
 
 def _decay_init(t2: list, t1: list) -> dict:
-    """Initial (d1, d2, r1, r2) values, in 1/us.
-
-    Both methods integrate the dissipator over the real gate durations in ns, so d
-    and r are absolute rates rather than per-repetition fractions:
-    d = 1000 / T_phi and r = 1000 / T1, where 1 / T_phi = 1 / T2 - 1 / (2 T1).
-    """
+    """Initial (d1, d2, r1, r2) in 1/us from T2, T1 in ns: 1000/T_phi and 1000/T1."""
     values = [
         1000 * (1 / t2[0] - 1 / (2 * t1[0])),
         1000 * (1 / t2[1] - 1 / (2 * t1[1])),
@@ -534,7 +447,7 @@ def _decay_init(t2: list, t1: list) -> dict:
     return {name: ("value", v) for name, v in zip(("d1", "d2", "r1", "r2"), values)}
 
 
-# Bounds and starting points the entries below share.
+# Shared by the entries below.
 _LOWER = {
     **{name: -0.3 for name in ("eta", "eps", "kap")},
     **{name: 0.0 for name in ("d1", "d2", "r1", "r2")},
@@ -571,7 +484,7 @@ _ZZ_LABELS = {"eta": "ZZ", "eps": "ZI", "kap": "IZ", "z1": "ZI", "z2": "IZ", "z1
 DB_SETS = {
     entry.name: entry
     for entry in (
-        # H CZ H  X  H CZ H  X, with the ideal CZ kept (it commutes with the error).
+        # The plain CZ node.
         DbSet(
             name="qubit_pairq3-6",
             blocks=(
@@ -743,8 +656,7 @@ DB_SETS = {
             upper=_UPPER,
             init=_INIT,
         ),
-        # Simulated data for the error-bar scripts: lab-frame ZZ/ZI/IZ, no pulses, Z
-        # readout. "mix" only; its rates are per step rather than 1/us.
+        # For the error-bar scripts: lab-frame ZZ/ZI/IZ, Z readout, "mix" only.
         DbSet(
             name="synthetic",
             blocks=None,
@@ -765,14 +677,10 @@ DB_SETS = {
 # Outcome probabilities
 ############
 def construct_unit_op(entry: DbSet, params: dict) -> np.ndarray:
-    """Superoperator of one full repetition of `entry`'s sequence.
-
-    Pass a `dataclasses.replace` of an entry to play different pulses (fim_check.py).
-    """
+    """Superoperator of one repetition of `entry`'s sequence ("model_dd")."""
     sequence = entry.compiled
     dissipator = _decay_super(params["d1"], params["d2"], params["r1"], params["r2"])
-    # Every block dwells for one of two durations, and every CZ carries the same
-    # coherent error, so three propagators cover the whole repetition.
+    # Two dwell times and one CZ error: three propagators cover the repetition.
     decay = {
         dwell: evolve(dissipator, dwell, "dissipator") for dwell in sequence.dwells
     }
@@ -809,7 +717,7 @@ def probabilities(
 ) -> np.ndarray:
     """P(00), P(01), P(10), P(11) after each of `n` repetitions, shape (len(n), 4).
 
-    n may be an int (meaning 0..n-1) or an array. `model` overrides MODEL.
+    `n` is an int (0..n-1) or an array; `model` overrides MODEL.
     """
     if isinstance(n, (int, np.integer)):
         n = np.arange(n)
@@ -817,10 +725,7 @@ def probabilities(
     model = MODEL if model is None else model
     rot = entry.readout_rot
     if model == "mix":
-        # exp(G t) s0 = V diag(exp(w t)) V^-1 s0, so one eigendecomposition of the
-        # (16, 16) generator gives *every* time step: fold V^-1 s0 and msmt_ops @ V
-        # into a single (16, 4) weight matrix, and the whole trajectory is one
-        # (len(n), 16) @ (16, 4) product.
+        # One eig of the generator gives every time step.
         coefficients = np.array([params[k] for k in _GENERATOR_NAMES], dtype=complex)
         basis = entry.mix_basis
         generator = (basis.reshape(len(_GENERATOR_NAMES), -1).T @ coefficients).reshape(
@@ -834,8 +739,7 @@ def probabilities(
         weights = (msmt_ops @ eigenvectors) * np.linalg.solve(eigenvectors, state)
         return np.real(np.exp(np.multiply.outer(4 * n, eigenvalues)) @ weights.T)
     if model == "model_dd":
-        # `unit_op` is the propagator of one repetition, so n repetitions is the
-        # matrix *power* unit_op**n = V diag(w**n) V^-1.
+        # unit_op ** n via its eigendecomposition.
         unit_op = construct_unit_op(entry, params)
         state = construct_init_state(rot, LEVELS).astype(complex)
         msmt_ops = construct_msmt_op(
