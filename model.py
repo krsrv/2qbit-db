@@ -337,15 +337,15 @@ _Z_RESIDUAL = np.array([_on(SIGMA_Z, 0), _on(SIGMA_Z, 1), np.kron(SIGMA_Z, SIGMA
 
 
 def _cz_block(err_ops, ideal=_II):
-    return (ideal, err_ops, TQ_GT)
+    return (ideal, err_ops, TQ_GT, "op")
 
 
 def _id_block():
-    return (np.eye(4), None, TQ_ID)
+    return (np.eye(4), None, TQ_ID, "idle")
 
 
 def _pulse_block(u):
-    return (u, None, SQ_GT)
+    return (u, None, SQ_GT, "dd")
 
 
 ############
@@ -364,8 +364,9 @@ class _Compiled(NamedTuple):
 class DbSet:
     """One experiment.
 
-    blocks: half a repetition in time order, as (pulse, err_ops, dwell_ns); err_ops is
-        a CZ block's (eta, eps, kap) Pauli triple, None for an error-free pulse.
+    blocks: half a repetition in time order, as (pulse, err_ops, dwell_ns, kind);
+        err_ops is a CZ block's (eta, eps, kap) Pauli triple, None for an error-free
+        pulse; kind is "op" (CZ), "idle" or "dd".
     generator_basis: explicit "mix" basis; None derives it from `blocks`.
     readout_rot: pre-measurement rotation, None for the Z basis.
     residual_ops: the (z1, z2, z12) operators.
@@ -392,14 +393,14 @@ class DbSet:
         """The "model_dd" form of `blocks`."""
         if self.blocks is None:
             raise ValueError(f"db_set {self.name!r} has no pulse sequence")
-        err_ops = next(ops for _, ops, _ in self.blocks if ops is not None)
+        err_ops = next(ops for _, ops, _, _ in self.blocks if ops is not None)
         return _Compiled(
             steps=tuple(
                 (_super(pulse), ops is not None, dwell)
-                for pulse, ops, dwell in self.blocks
+                for pulse, ops, dwell, _ in self.blocks
             ),
             err_supers=tuple(_hamiltonian_super(op) for op in err_ops),
-            dwells=tuple({dwell for _, _, dwell in self.blocks}),
+            dwells=tuple({dwell for _, _, dwell, _ in self.blocks}),
             residual_supers=(
                 ()
                 if self.residual_ops is None
@@ -420,7 +421,7 @@ class DbSet:
         # Both halves: the first leaves the frame rotated.
         basis = np.zeros((len(_GENERATOR_NAMES), DIM**2, DIM**2), dtype=complex)
         frame = np.eye(DIM**2, dtype=complex)
-        for pulse, err_ops, dwell in self.blocks * 2:
+        for pulse, err_ops, dwell, _ in self.blocks * 2:
             frame = _super(pulse) @ frame
             if err_ops is not None:
                 for slot, op in zip(_SLOTS["phase"], err_ops):
@@ -476,7 +477,14 @@ _INIT_SET1 = {
     **_SPAM_AND_RESIDUAL_INIT,
 }
 _Z_FIXED = {"z1": 0.0, "z2": 0.0, "z12": 0.0}
-_ZZ_LABELS = {"eta": "ZZ", "eps": "ZI", "kap": "IZ", "z1": "ZI", "z2": "IZ", "z12": "ZZ"}
+_ZZ_LABELS = {
+    "eta": "ZZ",
+    "eps": "ZI",
+    "kap": "IZ",
+    "z1": "ZI",
+    "z2": "IZ",
+    "z12": "ZZ",
+}
 
 # Each experiment set is one half repetition of a DD sequence.
 #   set1 -> ZZ, ZI, IZ      set2 -> YY, YI, IY      set3 -> XX, XI, IX
@@ -548,11 +556,11 @@ DB_SETS = {
             name="db_set2_qubit_pairq3-6",
             blocks=(
                 _id_block(),
-                _cz_block(_YY_ERR),
+                _cz_block(_YY_ERR, ideal=CZ),
                 _id_block(),
                 _pulse_block(_YI),
                 _id_block(),
-                _cz_block(_YY_ERR),
+                _cz_block(_YY_ERR, ideal=CZ),
                 _id_block(),
                 _pulse_block(_IY),
             ),
@@ -567,7 +575,7 @@ DB_SETS = {
                 "z2": "IZ",
                 "z12": "ZZ",
             },
-            fixed={},
+            fixed=_Z_FIXED,
             lower=_LOWER,
             upper=_UPPER,
             init=_INIT,
@@ -576,11 +584,11 @@ DB_SETS = {
             name="db_set3_qubit_pairq3-6",
             blocks=(
                 _id_block(),
-                _cz_block(_XX_ERR),
+                _cz_block(_XX_ERR, ideal=CZ),
                 _id_block(),
                 _pulse_block(_XI),
                 _id_block(),
-                _cz_block(_XX_ERR),
+                _cz_block(_XX_ERR, ideal=CZ),
                 _id_block(),
                 _pulse_block(_IX),
             ),
@@ -595,7 +603,7 @@ DB_SETS = {
                 "z2": "IZ",
                 "z12": "ZZ",
             },
-            fixed={},
+            fixed=_Z_FIXED,
             lower=_LOWER,
             upper=_UPPER,
             init=_INIT,
@@ -604,11 +612,11 @@ DB_SETS = {
             name="db_set4_qubit_pairq3-6",
             blocks=(
                 _id_block(),
-                _cz_block(_SET4_ERR),
+                _cz_block(_SET4_ERR, ideal=CZ),
                 _id_block(),
                 _pulse_block(_ZX),
                 _id_block(),
-                _cz_block(_SET4_ERR),
+                _cz_block(_SET4_ERR, ideal=CZ),
                 _id_block(),
                 _pulse_block(_XY),
             ),
@@ -632,11 +640,11 @@ DB_SETS = {
             name="db_set5_qubit_pairq3-6",
             blocks=(
                 _id_block(),
-                _cz_block(_SET5_ERR),
+                _cz_block(_SET5_ERR, ideal=CZ),
                 _id_block(),
                 _pulse_block(_XZ),
                 _id_block(),
-                _cz_block(_SET5_ERR),
+                _cz_block(_SET5_ERR, ideal=CZ),
                 _id_block(),
                 _pulse_block(_YX),
             ),

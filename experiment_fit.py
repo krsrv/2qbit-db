@@ -226,8 +226,6 @@ def get_decay_timescale(d1, d2, r1, r2, label: str) -> np.ndarray:
     return 1e3 * t1, 1e3 * t2
 
 
-# cond(V) past which an `eig` basis is too ill-conditioned to exponentiate through,
-
 ############
 # Fitting
 ############
