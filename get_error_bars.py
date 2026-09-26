@@ -12,7 +12,7 @@ Intended to be run in scripts that sweep over repetitions/shots, produce CSVs of
 and enable downstream plotting of errors, biases, and variances.
 
 Exports:
-    `PHASE_NAMES`: list of phase parameter names, used to group parameters by type.
+    `STATES`: the four outcome labels, in column order.
 """
 
 import argparse
@@ -21,10 +21,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from least_squares import PARAM_NAMES, fit_joint, get_fidelities
+from experiment_fit import fit_family
+from model import DB_SETS, PHASE_NAMES, probabilities
 
 HERE = Path(__file__).resolve().parent
 OUTPUT_CSV = HERE / "output" / "error_bars_weighted.csv"
+STATES = ["++", "+-", "-+", "--"]
+SYNTHETIC = DB_SETS["synthetic"]
 
 
 def construct_noisy_data(data, sigma=None, rng=None):
@@ -36,10 +39,6 @@ def construct_noisy_data(data, sigma=None, rng=None):
         axis=0,
     )
     return noisy_data
-
-
-# Every coefficient of a term in the coherent-error Hamiltonian.
-PHASE_NAMES = ["eta", "eps", "kap", "z1", "z2"]
 
 
 def canonicalize_signs(params):
@@ -72,22 +71,25 @@ def main():
     )
     args = parser.parse_args()
 
-    true_params = (
-        0.4 * np.pi / 180,
-        np.pi / 180,
-        0.2 * np.pi / 180,
-        0.0001,
-        0.003,
-        0.002,
-        0.001,
-        0.991,
-        0.992,
-        0.997,
-        0.995,
-    )
+    true_params = {
+        "eta": 0.4 * np.pi / 180,
+        "eps": np.pi / 180,
+        "kap": 0.2 * np.pi / 180,
+        "d1": 0.0001,
+        "d2": 0.003,
+        "r1": 0.002,
+        "r2": 0.001,
+        "ep1": 0.991,
+        "em1": 0.992,
+        "ep2": 0.997,
+        "em2": 0.995,
+        "z1": 0.0,
+        "z2": 0.0,
+        "z12": 0.0,
+    }
     # store truth on the same branch as the fits. Otherwise, there can be a "synthetic"
     # bias in the fits.
-    true_row = canonicalize_signs(dict(zip(PARAM_NAMES, true_params)))
+    true_row = canonicalize_signs(true_params)
     rows = []
 
     seed = 1
@@ -95,7 +97,7 @@ def main():
     max_reps = 50
     n_range = np.arange(max_reps)
     shot_range = range(1000, 11000, 1000)
-    true_data = get_fidelities(n_range, *true_params).real
+    true_data = probabilities(SYNTHETIC, true_params, n_range, model="mix")
 
     # Run sampling such that a noisy sample is created for 1,...,max_reps for a given number of
     # shots and prefixes are used for each repetition run.
@@ -114,12 +116,13 @@ def main():
             prev_fit_params = None
             for repetitions in range(10, max_reps, 5):
                 data = noisy_data_max_rep[:repetitions]
-                fit_params = fit_joint(
+                fit_params = fit_family(
+                    SYNTHETIC,
                     np.arange(repetitions),
                     data,
                     shots,
+                    rng,
                     n_restarts=10,
-                    rng=rng,
                     x0=(
                         prev_fit_params["result"].x
                         if prev_fit_params is not None

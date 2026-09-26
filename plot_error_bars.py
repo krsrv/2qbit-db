@@ -6,8 +6,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.colors import LogNorm
 
-from get_error_bars import PHASE_NAMES
-from least_squares import PARAM_NAMES
+from model import PARAM_NAMES, PHASE_NAMES
 
 HERE = Path(__file__).resolve().parent
 INPUT_CSV = HERE / "output" / "error_bars.csv"

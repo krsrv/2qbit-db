@@ -20,13 +20,17 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from least_squares import fit_joint, get_fidelities
+from experiment_fit import fit_family
+from model import DB_SETS, probabilities
 
 HERE = Path(__file__).resolve().parent
 
 STATES = ["++", "+-", "-+", "--"]
 CSV_COLUMN_FOR_STATE = {"++": "pp", "+-": "pm", "-+": "mp", "--": "mm"}
 PARAM_NAMES = ["eta", "eps", "kap", "d1", "d2", "r1", "r2"]
+SYNTHETIC = DB_SETS["synthetic"]
+# The CSVs carry no shot count; it only scales the weights, not the fitted point.
+SHOTS = 1000
 
 # ---------------------------------------------------------------------------
 # Data loading
@@ -42,7 +46,7 @@ def load_series(csv_path: Path) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     # }
     return (
         n,
-        df.to_numpy().T,
+        df.to_numpy(),
     )  # ---------------------------------------------------------------------------
 
 
@@ -282,15 +286,8 @@ def plot_data_and_fit(n_range, data: dict, params, out_path):
             label=key,
         )
 
-        fitted_data = get_fidelities(
-            n_range,
-            params["eta"],
-            params["eps"],
-            params["kap"],
-            params["d1"],
-            params["d2"],
-            params["r1"],
-            params["r2"],
+        fitted_data = probabilities(
+            SYNTHETIC, {**SYNTHETIC.fixed, **params}, n_range, model="mix"
         )
         plt.plot(
             n_range,
@@ -331,16 +328,16 @@ def main() -> None:
 
     # Global multi-start fit for the noiseless baseline.
     n0, data0 = load_series(datasets["noiseless"])
-    params0 = fit_joint(n0, data0)
+    params0 = fit_family(SYNTHETIC, n0, data0, SHOTS, np.random.default_rng())
     fitted["noiseless"] = params0
     print(f"[noiseless] joint fit over states {STATES} (n=0..{int(n0[-1])}):")
     print(format_params(params0))
     print()
 
     # Warm-start the noisy fit from the noiseless solution so both fits land in the
-    # same phase branch (see fit_joint docstring) and are directly comparable.
+    # same phase branch and are directly comparable.
     n1, data1 = load_series(datasets["noisy"])
-    params1 = fit_joint(n1, data1)
+    params1 = fit_family(SYNTHETIC, n1, data1, SHOTS, np.random.default_rng())
     fitted["noisy"] = params1
     print(
         f"[noisy] joint fit over states {STATES} (n=0..{int(n1[-1])}), warm-started from noiseless fit:"
@@ -381,8 +378,8 @@ def ibm_analysis():
         data1["--"][i] = dp["counts"]["11"] / num_shots
 
     # Warm-start the noisy fit from the noiseless solution so both fits land in the
-    # same phase branch (see fit_joint docstring) and are directly comparable.
-    params1 = fit_joint(n1, data1)
+    # same phase branch and are directly comparable.
+    params1 = fit_family(SYNTHETIC, n1, data1, SHOTS, np.random.default_rng())
     fitted["noisy"] = params1
     print(f"[noisy] joint fit over states {STATES} (n=0..{int(n1[-1])})")
     print(format_params(params1))
