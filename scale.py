@@ -1,8 +1,9 @@
-import itertools
-import re
-from functools import lru_cache
+"""
+Get estimator variance vs evolution time scaling for GLS.
+Max number of repititions is the proxy for evolution time.
+"""
+
 from pathlib import Path
-from typing import NamedTuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -55,11 +56,11 @@ TRUE_PARAMS = {
     "YX": 0.000,
     "YY": 0.000,
     "YZ": 0.000,
-    "YI": 0.000,
+    "YI": 0.030,
     "ZX": 0.000,
     "ZY": 0.000,
     "ZZ": 0.023,
-    "ZI": 0.000,
+    "ZI": 0.010,
     "IX": 0.000,
     "IY": 0.000,
     "IZ": 0.040,
@@ -104,7 +105,7 @@ def sample_joint_states(
     return idx // 2, idx % 2
 
 
-def _construct_unit_op(entry, params):
+def _construct_unit_op(entry: DbSet, params: dict):
     """Copy logic from `construct_unit_op` in model.py, changing only the error block."""
     sequence = entry.compiled
     dissipator = _decay_super(params["d1"], params["d2"], params["r1"], params["r2"])
@@ -128,8 +129,8 @@ def _construct_unit_op(entry, params):
     )
     frame = np.eye(DIM**2, dtype=complex)
     unit = np.eye(DIM**2, dtype=complex)
-    for pulse, is_cz, dwell in sequence.steps * 2:
-        block = error @ pulse if is_cz else pulse
+    for pulse, has_error_ops, dwell in sequence.steps * 2:
+        block = error @ pulse if has_error_ops else pulse
         frame = pulse @ frame
         step = decay[dwell] @ block
         if residual_gen is not None:
@@ -140,19 +141,30 @@ def _construct_unit_op(entry, params):
     return unit
 
 
-def get_simulated_probabilities(k: int, true_params: dict, n: np.ndarray):
+def get_simulated_probabilities(
+    k: int, true_params: dict, n: np.ndarray, return_op=False
+):
     err_ops = [
         np.kron(x, y)
         for x in [SIGMA_X, SIGMA_Y, SIGMA_Z, I2]
         for y in [SIGMA_X, SIGMA_Y, SIGMA_Z, I2]
     ]
     err_ops = err_ops[:-1]
-    cz_block = (CZ, err_ops, TQ_GT, "op")
+    ideal_cz_block = (CZ, None, TQ_GT, "op")
+    err_cz_block = (CZ, err_ops, TQ_GT, "op")
     entry = DB_SETS[set_label(k)]
     # Replace the pulse block with the error CZ block
     entry = DbSet(
         name=entry.name,
-        blocks=[x if x[-1] != "op" else cz_block for x in entry.blocks],
+        # blocks=[x if x[-1] != "op" else cz_block for x in entry.blocks],
+        blocks=[
+            z
+            for y in [
+                [x] if x[-1] != "op" else [ideal_cz_block, err_cz_block]
+                for x in entry.blocks
+            ]
+            for z in y
+        ],
         generator_basis=entry.generator_basis,
         readout_rot=entry.readout_rot,
         # z1, z2, z12 are not simulated, yet `get_ideal_true_params_for_expt` records
@@ -167,6 +179,8 @@ def get_simulated_probabilities(k: int, true_params: dict, n: np.ndarray):
 
     # Repeat logic in `probabilities` for the `model_dd` branch
     unit_op = _construct_unit_op(entry, true_params)
+    if return_op:
+        return unit_op
     state = construct_init_state(entry.readout_rot, LEVELS).astype(complex)
     msmt_ops = construct_msmt_op(
         true_params["ep1"],
@@ -491,7 +505,7 @@ def plot_scaling(rmse_df: pd.DataFrame, output_path: Path) -> None:
             for ax, name in zip(axes.flat, params):
                 sub = frame[frame["param"] == name].sort_values("repetitions")
                 reps = sub["repetitions"].to_numpy(dtype=float)
-                rmse = sub["rmse"].to_numpy(dtype=float)
+                rmse = sub["std"].to_numpy(dtype=float)
                 ax.loglog(reps, rmse, "o-", ms=4, lw=1.5, label="RMSE")
                 _slope_guides(ax, -1, "darkgreen", r"$n^{-1}$")
                 _slope_guides(ax, -0.5, "lightgreen", r"$n^{-1/2}$")
@@ -564,7 +578,7 @@ if __name__ == "__main__":
         # if args.output.exists():
         #     raise FileExistsError(f"Output file {args.output} already exists.")
         # truth = args.truth or args.data.parent / "ds_true.h5"
-        # df = extract_raw_scaling_data(args.data, truth, args.seed, 5000, 100)
+        # df = extract_raw_scaling_data(args.data, truth, args.seed, 5000, 200)
         # df.to_parquet(args.output, index=False)
 
         # rmse_df = analyze_scaling_data(df)
