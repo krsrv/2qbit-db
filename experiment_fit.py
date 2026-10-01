@@ -476,14 +476,18 @@ def plot_family(family: Family, entry: DbSet, params: dict, pdf: PdfPages) -> No
         ax.set_xlabel("number_of_operations")
     axes[0].set_ylabel("probability")
     axes[0].legend(loc="best", fontsize=8)
-    fig.suptitle(f"{family.label} (shots={family.shots}, model={MODEL})")
+    fig.suptitle(
+        f"{family.label} (shots={family.shots}, model={MODEL}, errors={entry.pauli_labels['eta'], entry.pauli_labels['eps'], entry.pauli_labels['kap']})"
+    )
     fig.tight_layout()
     pdf.savefig(fig)
     plt.close(fig)
 
 
 def analyze_experiments(data_path: Path, seed: int, output_prefix: Path):
-    if not data_path.exists():
+    # A CSV path may be a glob, e.g. S*_theta_0.csv, giving one family per file.
+    csv_paths = sorted(data_path.parent.glob(data_path.name))
+    if not csv_paths:
         raise FileNotFoundError(
             f"{data_path} does not exist. Pass --data pointing at an h5/csv file."
         )
@@ -497,19 +501,22 @@ def analyze_experiments(data_path: Path, seed: int, output_prefix: Path):
         families = iter_families(ds)
         print(f"fitting {len(families)} famil{'y' if len(families) == 1 else 'ies'}\n")
     elif data_path.suffix == ".csv":
-        if not data_path.exists():
-            raise FileNotFoundError(f"{data_path} does not exist.")
-        df = pd.read_csv(data_path)
-        n = df["n"].values
-        shots = (
-            df["shots"].iloc[0]
-            if "shots" in df.columns and len(df["shots"]) > 0
-            else 800
-        )
-        # A CSV holds a single family.
-        data = np.stack([df[c].values for c in ["00", "01", "10", "11"]], axis=-1)
-        family = Family("ibm_" + data_path.name, {}, n, data, None, shots)
-        families = [family]
+        families = []
+        for csv_path in csv_paths:
+            df = pd.read_csv(csv_path)
+            n = df["n"].values.astype(float)
+            shots = int(df["shots"].iloc[0])
+            # Each CSV holds a single family, S<k> -> db_set<k>.
+            set_idx = int(df["family"].iloc[0].lstrip("S"))
+            counts = np.stack(
+                [df[f"count_{ss}"].values for ss in JOINT_STATES], axis=-1
+            )
+            data = counts / counts.sum(axis=1, keepdims=True)
+            errs = np.sqrt(data * (1 - data) / shots)
+            families.append(
+                Family(f"db_set{set_idx}_qubit_pairq3-6", {}, n, data, errs, shots)
+            )
+        print(f"fitting {len(families)} famil{'y' if len(families) == 1 else 'ies'}\n")
     else:
         raise RuntimeError(f"Expected CSV or H5 file. Received {data_path.suffix}")
 
@@ -569,7 +576,7 @@ if __name__ == "__main__":
         "--data",
         type=Path,
         required=True,
-        help="Input file path (h5)",
+        help="Input file path (h5), or a quoted csv glob such as 'S*_theta_0.csv'",
     )
     parser.add_argument(
         "--seed",

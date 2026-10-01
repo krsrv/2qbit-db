@@ -272,7 +272,8 @@ CZ = construct_cz(LEVELS)
 CZ_SUPER = np.kron(CZ, CZ.conj())
 # Dissipators scaled by (d1, d2, r1, r2).
 DECAY_BASIS = construct_decay_basis(LEVELS)
-SQ_GT, TQ_GT, TQ_ID = 32, 60, 20
+# SQ_GT, TQ_GT, TQ_ID = 32, 60, 40
+SQ_GT, TQ_GT, TQ_ID = 40, 68 * 2 + 40 * 2, 0
 
 
 def _decay_super(d1, d2, r1, r2) -> np.ndarray:
@@ -476,7 +477,9 @@ _INIT_SET1 = {
     **_decay_init(_T2, _T1),
     **_SPAM_AND_RESIDUAL_INIT,
 }
-_Z_FIXED = {"z1": 0.0, "z2": 0.0, "z12": 0.0}
+_Z_FIXED = {
+    k.name: 0.0 for k in PARAMS if k.group == "residual"
+}  # or k.group == "spam"
 _ZZ_LABELS = {
     "eta": "ZZ",
     "eps": "ZI",
@@ -535,13 +538,21 @@ DB_SETS = {
             name="db_set1_qubit_pairq3-6",
             blocks=(
                 _id_block(),
+                _cz_block(None, ideal=CZ),
+                _id_block(),
+                _id_block(),
                 _cz_block(_ZZ_ERR, ideal=CZ),
                 _id_block(),
-                _pulse_block(_ZI),
+                _pulse_block(_XI),
+                _pulse_block(_YI),
+                _id_block(),
+                _cz_block(None, ideal=CZ),
+                _id_block(),
                 _id_block(),
                 _cz_block(_ZZ_ERR, ideal=CZ),
                 _id_block(),
-                _pulse_block(_IZ),
+                _pulse_block(_XI),
+                _pulse_block(_YI),
             ),
             generator_basis=None,
             readout_rot=construct_readout_rotation(LEVELS),
@@ -556,9 +567,15 @@ DB_SETS = {
             name="db_set2_qubit_pairq3-6",
             blocks=(
                 _id_block(),
+                _cz_block(None, ideal=CZ),
+                _id_block(),
+                _id_block(),
                 _cz_block(_YY_ERR, ideal=CZ),
                 _id_block(),
                 _pulse_block(_YI),
+                _id_block(),
+                _cz_block(None, ideal=CZ),
+                _id_block(),
                 _id_block(),
                 _cz_block(_YY_ERR, ideal=CZ),
                 _id_block(),
@@ -584,9 +601,15 @@ DB_SETS = {
             name="db_set3_qubit_pairq3-6",
             blocks=(
                 _id_block(),
+                _cz_block(None, ideal=CZ),
+                _id_block(),
+                _id_block(),
                 _cz_block(_XX_ERR, ideal=CZ),
                 _id_block(),
                 _pulse_block(_XI),
+                _id_block(),
+                _cz_block(None, ideal=CZ),
+                _id_block(),
                 _id_block(),
                 _cz_block(_XX_ERR, ideal=CZ),
                 _id_block(),
@@ -612,9 +635,15 @@ DB_SETS = {
             name="db_set4_qubit_pairq3-6",
             blocks=(
                 _id_block(),
+                _cz_block(None, ideal=CZ),
+                _id_block(),
+                _id_block(),
                 _cz_block(_SET4_ERR, ideal=CZ),
                 _id_block(),
                 _pulse_block(_ZX),
+                _id_block(),
+                _cz_block(None, ideal=CZ),
+                _id_block(),
                 _id_block(),
                 _cz_block(_SET4_ERR, ideal=CZ),
                 _id_block(),
@@ -640,9 +669,15 @@ DB_SETS = {
             name="db_set5_qubit_pairq3-6",
             blocks=(
                 _id_block(),
+                _cz_block(None, ideal=CZ),
+                _id_block(),
+                _id_block(),
                 _cz_block(_SET5_ERR, ideal=CZ),
                 _id_block(),
                 _pulse_block(_XZ),
+                _id_block(),
+                _cz_block(None, ideal=CZ),
+                _id_block(),
                 _id_block(),
                 _cz_block(_SET5_ERR, ideal=CZ),
                 _id_block(),
