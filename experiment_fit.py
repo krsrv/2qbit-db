@@ -448,8 +448,9 @@ def plot_family(family: Family, entry: DbSet, params: dict, pdf: PdfPages) -> No
     """Append a page of data vs. fit to `pdf`; `params` is the full parameter point."""
     dense_n = np.linspace(float(np.min(family.n)), float(np.max(family.n)), PLOT_POINTS)
     model = probabilities(entry, params, dense_n).real
-    fig, axes = plt.subplots(1, 4, figsize=(16, 3.4), sharex=True, sharey=True)
-    for idx, (ax, ss) in enumerate(zip(axes, JOINT_STATES)):
+    # Top row: data vs. fit. Bottom row: residual, on its own scale.
+    fig, axes = plt.subplots(2, 4, figsize=(16, 6.4), sharex=True, sharey="row")
+    for idx, (ax, res_ax, ss) in enumerate(zip(axes[0], axes[1], JOINT_STATES)):
         errs = family.errs[:, idx] if family.errs is not None else None
         ax.errorbar(
             family.n,
@@ -471,11 +472,24 @@ def plot_family(family: Family, entry: DbSet, params: dict, pdf: PdfPages) -> No
             color="crimson",
             label="fit",
         )
+        res_ax.plot(
+            family.n,
+            probabilities(entry, params, family.n).real[:, idx] - family.data[:, idx],
+            linestyle="-",
+            marker=None,
+            ms=2,
+            lw=1.5,
+            color="black",
+            label="residual",
+        )
+        res_ax.axhline(0, color="grey", lw=0.8)
 
         ax.set_title(f"P_{ss}")
-        ax.set_xlabel("number_of_operations")
-    axes[0].set_ylabel("probability")
-    axes[0].legend(loc="best", fontsize=8)
+        res_ax.set_xlabel("number_of_operations")
+    axes[0, 0].set_ylabel("probability")
+    axes[1, 0].set_ylabel("fit − data")
+    axes[0, 0].legend(loc="best", fontsize=8)
+    axes[1, 0].legend(loc="best", fontsize=8)
     fig.suptitle(
         f"{family.label} (shots={family.shots}, model={MODEL}, errors={entry.pauli_labels['eta'], entry.pauli_labels['eps'], entry.pauli_labels['kap']})"
     )
@@ -504,7 +518,7 @@ def analyze_experiments(data_path: Path, seed: int, output_prefix: Path):
         families = []
         for csv_path in csv_paths:
             df = pd.read_csv(csv_path)
-            n = df["n"].values.astype(float)
+            n = df["n"].values.astype(float) / 2
             shots = int(df["shots"].iloc[0])
             # Each CSV holds a single family, S<k> -> db_set<k>.
             set_idx = int(df["family"].iloc[0].lstrip("S"))
