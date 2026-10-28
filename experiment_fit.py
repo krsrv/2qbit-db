@@ -135,6 +135,8 @@ def process_ds_raw(ds: xr.Dataset) -> xr.Dataset:
 N_RESTARTS = 20
 GLS_PASSES = 2
 GLS_TOL = 1e-9
+# A phase whose lone sign flip raises chi^2 by less than this (1 sigma) is reported as |phase|.
+SIGN_FLIP_DCHI2 = 1.0
 
 # Warm-chained fits use a growing prefix of the time steps, as get_error_bars.py does.
 MIN_REPETITIONS = 10
@@ -396,6 +398,40 @@ def _canonicalize(fit_params: dict, entry: DbSet, family: Family) -> dict:
     }
 
 
+def _magnitudes_if_sign_free(
+    fit_params: dict, entry: DbSet, n: np.ndarray, data: np.ndarray, shots: int
+) -> dict:
+    """Report |phase| for each free phase whose sign flip moves chi^2 by < SIGN_FLIP_DCHI2.
+
+    Flips are tried one phase at a time; `sign_free` lists the phases reported as magnitudes.
+    """
+    names = _free_names(entry)
+    x = np.array([fit_params[name] for name in names])
+    chi2 = np.sum(_residuals(x, entry, n, data, shots) ** 2)
+    out = dict(fit_params)
+    sign_free = []
+    for i, name in enumerate(names):
+        if name not in PHASE_NAMES:
+            continue
+        flipped = x.copy()
+        flipped[i] = -flipped[i]
+        if np.sum(_residuals(flipped, entry, n, data, shots) ** 2) - chi2 < SIGN_FLIP_DCHI2:
+            out[name] = abs(fit_params[name])
+            sign_free.append(name)
+    out["sign_free"] = ",".join(sign_free)
+    return out
+
+
+def _drop_early(family: Family, nmin: float) -> Family:
+    """Keep only the time steps with n >= nmin."""
+    keep = family.n >= nmin
+    return family._replace(
+        n=family.n[keep],
+        data=family.data[keep],
+        errs=None if family.errs is None else family.errs[keep],
+    )
+
+
 def process_single_family(family: Family, rng) -> list[dict]:
     """Fit `family` on each prefix of its time steps, warm-chaining the solutions.
 
@@ -433,7 +469,11 @@ def process_single_family(family: Family, rng) -> list[dict]:
             "shots": family.shots,
             "model": MODEL,
         }
-        row.update(_canonicalize(fit_params, entry, family))
+        row.update(
+            _magnitudes_if_sign_free(
+                _canonicalize(fit_params, entry, family), entry, n, data, family.shots
+            )
+        )
         rows.append(row)
         prev_fit_params = fit_params  # Warm-chaining solutions
         print(
@@ -498,7 +538,9 @@ def plot_family(family: Family, entry: DbSet, params: dict, pdf: PdfPages) -> No
     plt.close(fig)
 
 
-def analyze_experiments(data_path: Path, seed: int, output_prefix: Path):
+def analyze_experiments(
+    data_path: Path, seed: int, output_prefix: Path, nmin: float = 0.0
+):
     # A CSV path may be a glob, e.g. S*_theta_0.csv, giving one family per file.
     csv_paths = sorted(data_path.parent.glob(data_path.name))
     if not csv_paths:
@@ -534,6 +576,10 @@ def analyze_experiments(data_path: Path, seed: int, output_prefix: Path):
     else:
         raise RuntimeError(f"Expected CSV or H5 file. Received {data_path.suffix}")
 
+    if nmin > 0:
+        families = [_drop_early(family, nmin) for family in families]
+        print(f"keeping n >= {nmin:g}\n")
+
     rng = np.random.default_rng(seed)
 
     # Writes output_prefix.pdf and output_prefix.csv.
@@ -568,6 +614,7 @@ def analyze_experiments(data_path: Path, seed: int, output_prefix: Path):
                 f"  -> fixed: {', '.join(f'{k}={v:+.5f}' for k, v in entry.fixed.items())}\n"
                 f"  -> cost={final['true_cost']:.1f}\n"
                 f"  -> {', '.join(f'{entry.pauli_labels[k]}={final[k]/2/np.pi/TQ_GT*1e6:+.5f}' for k in PHASE_NAMES if k in final)}\n"
+                f"  -> sign undetermined, |value| reported: {final['sign_free'] or 'none'}\n"
                 f"  -> t1: {t1}, t2: {t2}\n"
                 f"reduced_chi2={final['reduced_chi2']:.2f} rmse={final['rmse']:.4f}\n"
             )
@@ -604,6 +651,12 @@ if __name__ == "__main__":
         required=True,
         help="Output file path (folder + prefix). The generated files will be .pdf and .csv",
     )
+    parser.add_argument(
+        "--nmin",
+        type=float,
+        default=0.0,
+        help="Drop time steps with n < nmin before fitting. Default 0 keeps all.",
+    )
     args = parser.parse_args()
 
-    analyze_experiments(args.data, args.seed, args.output_prefix)
+    analyze_experiments(args.data, args.seed, args.output_prefix, args.nmin)
